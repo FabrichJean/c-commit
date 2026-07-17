@@ -100,6 +100,84 @@ function locateClaudeCodeDir(): string | null {
   return null;
 }
 
+// Encode an absolute project path the same way Claude Code does for ~/.claude/projects/<encoded>
+function encodeProjectPath(absPath: string): string {
+  return absPath.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+interface SessionSummary {
+  file: string;
+  filePath: string;
+  mtime: Date;
+  messageCount: number;
+  title: string;
+  firstUserMessage: string;
+}
+
+// Extract the text out of a Claude Code message content block array
+function extractText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((block: any) => {
+      if (block?.type === 'text') return block.text;
+      if (block?.type === 'tool_use') return `[tool: ${block.name}]`;
+      if (block?.type === 'tool_result') return `[tool result]`;
+      return '';
+    })
+    .filter(Boolean)
+    .join(' ');
+}
+
+// Summarize a single .jsonl session transcript file
+function summarizeSession(filePath: string): SessionSummary {
+  const stats = fs.statSync(filePath);
+  const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
+  let messageCount = 0;
+  let firstUserMessage = '';
+  let title = '';
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type === 'user' || entry.type === 'assistant') {
+        messageCount++;
+        if (!firstUserMessage && entry.type === 'user') {
+          firstUserMessage = extractText(entry.message?.content).slice(0, 60);
+        }
+      } else if (entry.type === 'ai-title' && entry.aiTitle) {
+        title = entry.aiTitle;
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return { file: path.basename(filePath), filePath, mtime: stats.mtime, messageCount, title, firstUserMessage };
+}
+
+// Read the full user/assistant transcript out of a .jsonl session file
+function readSessionTranscript(filePath: string): { role: string; text: string; timestamp: string }[] {
+  const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
+  const transcript: { role: string; text: string; timestamp: string }[] = [];
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type === 'user' || entry.type === 'assistant') {
+        const text = extractText(entry.message?.content);
+        if (text) {
+          transcript.push({ role: entry.type, text, timestamp: entry.timestamp });
+        }
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return transcript;
+}
+
 // Check whether the local `claude` executable (Claude Code CLI) is installed and on PATH
 function isClaudeCliAvailable(): string | null {
   try {
@@ -249,17 +327,21 @@ async function main() {
       console.log(`${C.brightCyan}${C.bold}💬 LOCATE & READ LOCAL CLAUDE CODE SESSIONS${C.reset}`);
       console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
 
-      const rawClaudeDir = await question(`Enter a folder path to inspect (${C.dim}default: auto-detect${C.reset}): `);
+      const rawProjDir = await question(`Which project folder's chat history do you want to view? (${C.dim}default: current directory${C.reset}): `);
+      const targetProj = rawProjDir.trim().length > 0 ? resolvePath(rawProjDir) : process.cwd();
 
       clearScreen();
-      console.log(`${C.brightCyan}${C.bold}💬 SEARCHING FOR LOCAL CLAUDE CODE CHAT RECORDS...${C.reset}\n`);
+      console.log(`${C.brightCyan}${C.bold}💬 SEARCHING FOR LOCAL CLAUDE CODE CHAT RECORDS...${C.reset}`);
+      console.log(`${C.dim}Project: ${C.reset}${C.brightWhite}${targetProj}${C.reset}\n`);
 
-      const hasCustomDir = rawClaudeDir.trim().length > 0;
-      const dir = hasCustomDir ? resolvePath(rawClaudeDir) : locateClaudeCodeDir();
-      if (!dir || !fs.existsSync(dir)) {
-        if (hasCustomDir) {
-          console.log(`${C.red}⚠️ Path does not exist: ${dir}${C.reset}\n`);
-        }
+      if (!fs.existsSync(targetProj) || !fs.statSync(targetProj).isDirectory()) {
+        console.log(`${C.red}⚠️ Path does not exist or is not a directory.${C.reset}`);
+        await pressEnterToContinue();
+        continue;
+      }
+
+      const claudeHome = locateClaudeCodeDir();
+      if (!claudeHome) {
         console.log(`${C.yellow}No local Claude Code config folder found.${C.reset}`);
         console.log(`Claude Code typically stores persistent session cache in:`);
         console.log(`  - macOS: ~/Library/Application Support/claude-code/`);
@@ -267,32 +349,55 @@ async function main() {
         console.log(`  - Windows: %APPDATA%\\claude-code\\`);
         console.log(`\n${C.dim}Tip: Make sure you have installed Claude Code globally via:${C.reset}`);
         console.log(`  ${C.brightCyan}npm i -g @anthropic-ai/claude-code${C.reset}`);
-      } else {
-        console.log(`${C.green}✔ Found Claude config directory at: ${C.bold}${dir}${C.reset}`);
-        
-        // Scan for files inside
-        try {
-          const configFiles = fs.readdirSync(dir);
-          console.log(`\nConfig files in cache:`);
-          configFiles.forEach(f => {
-            const stats = fs.statSync(path.join(dir, f));
-            console.log(`  - ${f} (${(stats.size / 1024).toFixed(1)} KB)`);
-          });
-          
-          console.log(`\n${C.green}Checking active processes...${C.reset}`);
-          const claudeExecPath = isClaudeCliAvailable();
-          if (claudeExecPath) {
-            console.log(`  - ${C.bold}Claude Executable:${C.reset} ${C.brightCyan}Installed${C.reset} (at ${claudeExecPath})`);
-          } else {
-            console.log(`  - ${C.bold}Claude Executable:${C.reset} ${C.yellow}Not globally registered in PATH${C.reset}`);
-          }
-        } catch (err: any) {
-          console.log(`${C.red}Error scanning Claude directory: ${err.message}${C.reset}`);
-        }
+        await pressEnterToContinue();
+        continue;
       }
-      
+
+      const sessionDir = path.join(claudeHome, 'projects', encodeProjectPath(targetProj));
+      if (!fs.existsSync(sessionDir)) {
+        console.log(`${C.yellow}No chat history found for this project.${C.reset}`);
+        console.log(`${C.dim}(Looked in: ${sessionDir})${C.reset}`);
+        await pressEnterToContinue();
+        continue;
+      }
+
+      const sessionFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith('.jsonl'));
+      if (sessionFiles.length === 0) {
+        console.log(`${C.yellow}No chat sessions found for this project.${C.reset}`);
+        await pressEnterToContinue();
+        continue;
+      }
+
+      const summaries = sessionFiles
+        .map(f => summarizeSession(path.join(sessionDir, f)))
+        .filter(s => s.messageCount > 0)
+        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+      console.log(`${C.green}✔ Found ${summaries.length} chat session(s):${C.reset}\n`);
+      summaries.forEach((s, idx) => {
+        console.log(`${C.brightCyan}${C.bold}[${idx + 1}]${C.reset} ${C.bold}${C.white}${s.title || '(untitled session)'}${C.reset} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
+        console.log(`    ${C.dim}"${s.firstUserMessage || '(no user message)'}"${C.reset}`);
+      });
+
+      const rawPick = await question(`\nEnter a session number to view its transcript (${C.dim}or press Enter to skip${C.reset}): `);
+      const pick = parseInt(rawPick.trim());
+
+      if (!isNaN(pick) && pick >= 1 && pick <= summaries.length) {
+        const chosen = summaries[pick - 1];
+        const transcript = readSessionTranscript(chosen.filePath);
+
+        console.log(`\n${C.brightCyan}${C.bold}📜 TRANSCRIPT: ${chosen.title || chosen.file}${C.reset}`);
+        console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
+        transcript.forEach(m => {
+          const roleColor = m.role === 'user' ? C.brightYellow : C.brightGreen;
+          const roleLabel = m.role === 'user' ? 'USER' : 'CLAUDE';
+          console.log(`${roleColor}${C.bold}[${roleLabel}]${C.reset} ${C.dim}${new Date(m.timestamp).toLocaleString()}${C.reset}`);
+          console.log(`${m.text}\n`);
+        });
+      }
+
       await pressEnterToContinue();
-    } 
+    }
     else if (choice === '3') {
       clearScreen();
       console.log(`${C.brightCyan}${C.bold}📅 INTERACTIVE GIT COMMIT TIMELINE SUGGESTER${C.reset}`);
@@ -334,8 +439,8 @@ async function main() {
         return JSON.parse(cleanText);
       };
 
-      const printCommits = (commits: any[], intelligent: boolean) => {
-        console.log(`\n${C.green}✔ Generated ${commits.length} ${intelligent ? 'intelligent' : 'chronological'} commits:${C.reset}\n`);
+      const printCommits = (commits: any[], intelligent: boolean, method: string) => {
+        console.log(`\n${C.green}✔ Generated ${commits.length} ${intelligent ? 'intelligent' : 'chronological'} commits ${C.dim}(method: ${C.reset}${C.bold}${method}${C.reset}${C.dim})${C.reset}\n`);
         commits.forEach((c: any, idx: number) => {
           console.log(`${C.brightCyan}${C.bold}[COMMIT #${idx+1}]${C.reset}`);
           console.log(`  ${C.bold}Hash:   ${C.reset}${C.brightYellow}${c.hash}${C.reset}`);
@@ -349,6 +454,7 @@ async function main() {
 
       let commits: any[] | null = null;
       let intelligent = false;
+      let method = 'Procedural (offline generator)';
 
       const claudeCliPath = isClaudeCliAvailable();
       if (claudeCliPath) {
@@ -363,17 +469,23 @@ async function main() {
           const text = parsed.result ?? parsed.content ?? '';
           commits = parseJsonCommits(text);
           intelligent = true;
+          method = 'Claude Code CLI (local)';
         } catch (err: any) {
           console.log(`${C.yellow}Local Claude Code CLI call failed: ${err.message}${C.reset}`);
         }
       }
 
       if (!commits) {
-        const key = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.GEMINI_API_KEY;
-        if (key) {
-          console.log(`${C.dim}Consulting AI Planner via API for intelligent chronological progression...${C.reset}`);
+        const keySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY'
+          : process.env.CLAUDE_API_KEY ? 'CLAUDE_API_KEY'
+          : process.env.GEMINI_API_KEY ? 'GEMINI_API_KEY'
+          : null;
+
+        if (keySource) {
+          const key = process.env[keySource]!;
+          const isAnthropic = keySource === 'ANTHROPIC_API_KEY' || keySource === 'CLAUDE_API_KEY';
+          console.log(`${C.dim}Consulting AI Planner via ${C.reset}${C.bold}${keySource}${C.reset}${C.dim} for intelligent chronological progression...${C.reset}`);
           try {
-            const isAnthropic = !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY);
             let text = '';
 
             if (isAnthropic) {
@@ -408,6 +520,7 @@ async function main() {
 
             commits = parseJsonCommits(text);
             intelligent = true;
+            method = keySource;
           } catch (err: any) {
             console.log(`${C.red}AI request failed: ${err.message}. Falling back to procedural timeline generator.${C.reset}`);
           }
@@ -417,9 +530,10 @@ async function main() {
       if (!commits) {
         commits = generateProceduralCommits(count, projName);
         intelligent = false;
+        method = 'Procedural (offline generator)';
       }
 
-      printCommits(commits, intelligent);
+      printCommits(commits, intelligent, method);
 
       await pressEnterToContinue();
     }

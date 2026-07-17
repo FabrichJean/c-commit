@@ -1,4 +1,4 @@
-import { execSync, execFileSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -70,6 +70,19 @@ const isGitRepo = (dir: string): boolean => {
   } catch {
     return false;
   }
+};
+
+// Read the local (falling back to global) Git author identity, "Name <email>"
+const getGitAuthor = (dir: string): string => {
+  try {
+    const name = execSync('git config user.name', { cwd: dir, stdio: 'pipe' }).toString().trim();
+    const email = execSync('git config user.email', { cwd: dir, stdio: 'pipe' }).toString().trim();
+    if (name && email) return `${name} <${email}>`;
+    if (name) return name;
+  } catch {
+    // No Git identity configured
+  }
+  return 'Claude Code <claude@anthropic.com>';
 };
 
 // Expand a leading ~ to the user's home directory and resolve to an absolute path
@@ -178,6 +191,107 @@ function readSessionTranscript(filePath: string): { role: string; text: string; 
   return transcript;
 }
 
+// Locate the Claude Code session folder for a given project and summarize its sessions
+function findProjectSessions(projDir: string): { claudeHome: string | null; sessionDir: string | null; summaries: SessionSummary[] } {
+  const claudeHome = locateClaudeCodeDir();
+  if (!claudeHome) return { claudeHome: null, sessionDir: null, summaries: [] };
+
+  const sessionDir = path.join(claudeHome, 'projects', encodeProjectPath(projDir));
+  if (!fs.existsSync(sessionDir)) return { claudeHome, sessionDir: null, summaries: [] };
+
+  const sessionFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith('.jsonl'));
+  const summaries = sessionFiles
+    .map(f => summarizeSession(path.join(sessionDir, f)))
+    .filter(s => s.messageCount > 0)
+    .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+  return { claudeHome, sessionDir, summaries };
+}
+
+interface FileChange {
+  file: string;
+  tool: string;
+  detail: string;
+  timestamp: string;
+}
+
+// Pull the real file modifications (Edit/Write/MultiEdit/NotebookEdit tool calls) out of one or more sessions
+function extractFileChanges(sessionFilePaths: string[]): FileChange[] {
+  const changes: FileChange[] = [];
+
+  for (const filePath of sessionFilePaths) {
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
+    } catch {
+      continue;
+    }
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type !== 'assistant') continue;
+        const content = entry.message?.content;
+        if (!Array.isArray(content)) continue;
+
+        for (const block of content) {
+          if (block?.type !== 'tool_use') continue;
+          const input = block.input || {};
+
+          if (block.name === 'Edit') {
+            changes.push({
+              file: input.file_path || 'unknown file',
+              tool: 'Edit',
+              detail: String(input.new_string || '').slice(0, 80).replace(/\n/g, ' '),
+              timestamp: entry.timestamp
+            });
+          } else if (block.name === 'MultiEdit') {
+            changes.push({
+              file: input.file_path || 'unknown file',
+              tool: 'MultiEdit',
+              detail: `${Array.isArray(input.edits) ? input.edits.length : '?'} edit(s)`,
+              timestamp: entry.timestamp
+            });
+          } else if (block.name === 'Write') {
+            changes.push({
+              file: input.file_path || 'unknown file',
+              tool: 'Write',
+              detail: 'file created/overwritten',
+              timestamp: entry.timestamp
+            });
+          } else if (block.name === 'NotebookEdit') {
+            changes.push({
+              file: input.notebook_path || 'unknown notebook',
+              tool: 'NotebookEdit',
+              detail: 'notebook cell edited',
+              timestamp: entry.timestamp
+            });
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+  }
+
+  return changes;
+}
+
+// Group raw file changes by file (relative to the project dir) for display/prompt use
+function groupChangesByFile(changes: FileChange[], baseDir: string): { file: string; tools: string[]; count: number }[] {
+  const map = new Map<string, { tools: Set<string>; count: number }>();
+
+  for (const c of changes) {
+    const key = path.isAbsolute(c.file) ? path.relative(baseDir, c.file) : c.file;
+    if (!map.has(key)) map.set(key, { tools: new Set(), count: 0 });
+    const entry = map.get(key)!;
+    entry.tools.add(c.tool);
+    entry.count++;
+  }
+
+  return Array.from(map.entries()).map(([file, v]) => ({ file, tools: Array.from(v.tools), count: v.count }));
+}
+
 // Check whether the local `claude` executable (Claude Code CLI) is installed and on PATH
 function isClaudeCliAvailable(): string | null {
   try {
@@ -187,6 +301,53 @@ function isClaudeCliAvailable(): string | null {
   } catch {
     return null;
   }
+}
+
+// Run the local Claude Code CLI in streaming mode, printing its output live as it's generated
+function runClaudeCliStreaming(prompt: string, cwd: string, onText: (chunk: string) => void): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('claude', ['-p', prompt, '--output-format', 'stream-json', '--include-partial-messages', '--verbose'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let buffer = '';
+    let finalResult = '';
+    let errOutput = '';
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf-8');
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'stream_event' && event.event?.type === 'content_block_delta' && event.event.delta?.type === 'text_delta') {
+            onText(event.event.delta.text);
+          } else if (event.type === 'result') {
+            finalResult = event.result ?? '';
+          }
+        } catch {
+          // Skip malformed / partial JSON lines
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      errOutput += chunk.toString('utf-8');
+    });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0 && !finalResult) {
+        reject(new Error(errOutput.trim() || `claude exited with code ${code}`));
+      } else {
+        resolve(finalResult);
+      }
+    });
+  });
 }
 
 // Generate high fidelity procedural fallback commits
@@ -204,6 +365,29 @@ function generateProceduralCommits(count: number, projectName: string) {
       hash,
       subject: `${stage} - checkpoint progress #${i+1}`,
       body: `Automated progressive build verification for the active code module of ${projectName}.`,
+      timestamp,
+      author: "Claude Code <claude@anthropic.com>"
+    });
+  }
+  return commits;
+}
+
+// Offline fallback that groups real Claude Code file changes into commits (no AI required)
+function generateProceduralCommitsFromChanges(changes: FileChange[], count: number, projectName: string, projDir: string) {
+  const grouped = groupChangesByFile(changes, projDir);
+  const commits = [];
+  const start = Date.now() - count * 24 * 60 * 60 * 1000;
+
+  for (let i = 0; i < count; i++) {
+    const group = grouped[i % grouped.length];
+    const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toLocaleString();
+    const hash = Math.random().toString(16).substring(2, 9);
+    const verb = group.tools.length === 1 && group.tools[0] === 'Write' ? 'add' : 'update';
+
+    commits.push({
+      hash,
+      subject: `chore: ${verb} ${group.file}`,
+      body: `Based on ${group.count} real modification(s) made by Claude Code to ${group.file} (${group.tools.join(', ')}) in ${projectName}.`,
       timestamp,
       author: "Claude Code <claude@anthropic.com>"
     });
@@ -340,7 +524,7 @@ async function main() {
         continue;
       }
 
-      const claudeHome = locateClaudeCodeDir();
+      const { claudeHome, sessionDir, summaries } = findProjectSessions(targetProj);
       if (!claudeHome) {
         console.log(`${C.yellow}No local Claude Code config folder found.${C.reset}`);
         console.log(`Claude Code typically stores persistent session cache in:`);
@@ -353,25 +537,18 @@ async function main() {
         continue;
       }
 
-      const sessionDir = path.join(claudeHome, 'projects', encodeProjectPath(targetProj));
-      if (!fs.existsSync(sessionDir)) {
+      if (!sessionDir) {
         console.log(`${C.yellow}No chat history found for this project.${C.reset}`);
-        console.log(`${C.dim}(Looked in: ${sessionDir})${C.reset}`);
+        console.log(`${C.dim}(Looked in: ${path.join(claudeHome, 'projects', encodeProjectPath(targetProj))})${C.reset}`);
         await pressEnterToContinue();
         continue;
       }
 
-      const sessionFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith('.jsonl'));
-      if (sessionFiles.length === 0) {
+      if (summaries.length === 0) {
         console.log(`${C.yellow}No chat sessions found for this project.${C.reset}`);
         await pressEnterToContinue();
         continue;
       }
-
-      const summaries = sessionFiles
-        .map(f => summarizeSession(path.join(sessionDir, f)))
-        .filter(s => s.messageCount > 0)
-        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
       console.log(`${C.green}✔ Found ${summaries.length} chat session(s):${C.reset}\n`);
       summaries.forEach((s, idx) => {
@@ -413,15 +590,70 @@ async function main() {
       }
 
       const projName = path.basename(projDir);
+      const gitAuthor = getGitAuthor(projDir);
       const rawCount = await question(`How many commits would you like to suggest? (default: 5): `);
       const count = parseInt(rawCount) || 5;
 
       const rawDays = await question(`Over how many days of timeline history? (default: 3): `);
       const days = parseInt(rawDays) || 3;
 
-      console.log(`\n${C.brightYellow}Generating timeline spanning ${days} days for project "${projName}" (${C.dim}${projDir}${C.reset}${C.brightYellow})...${C.reset}`);
+      console.log(`\n${C.bold}Base suggestions on real Claude Code modifications?${C.reset}`);
+      console.log(`  [1] A specific chat session`);
+      console.log(`  [2] All sessions for this project (general)`);
+      console.log(`  [3] No - generate generic suggestions`);
+      const rawBasis = await question(`Choice (default: 3): `);
+      const basisChoice = rawBasis.trim() || '3';
 
-      const prompt = `
+      let changes: FileChange[] = [];
+      let basisLabel = 'Generic (no session data)';
+
+      if (basisChoice === '1' || basisChoice === '2') {
+        const sessions = findProjectSessions(projDir);
+        if (!sessions.claudeHome || !sessions.sessionDir || sessions.summaries.length === 0) {
+          console.log(`${C.yellow}No Claude Code chat history found for this project — falling back to generic suggestions.${C.reset}`);
+        } else if (basisChoice === '2') {
+          changes = extractFileChanges(sessions.summaries.map(s => s.filePath));
+          basisLabel = changes.length > 0
+            ? `General - ${sessions.summaries.length} session(s), ${changes.length} file change(s)`
+            : 'Generic (no file changes recorded across sessions)';
+        } else {
+          console.log(`\n${C.bold}Available sessions:${C.reset}`);
+          sessions.summaries.forEach((s, idx) => {
+            console.log(`${C.brightCyan}${C.bold}[${idx + 1}]${C.reset} ${C.white}${s.title || '(untitled session)'}${C.reset} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
+          });
+          const rawPick = await question(`\nEnter a session number (${C.dim}default: most recent${C.reset}): `);
+          const pick = parseInt(rawPick.trim());
+          const chosen = (!isNaN(pick) && pick >= 1 && pick <= sessions.summaries.length) ? sessions.summaries[pick - 1] : sessions.summaries[0];
+          changes = extractFileChanges([chosen.filePath]);
+          basisLabel = changes.length > 0
+            ? `Session "${chosen.title || chosen.file}" - ${changes.length} file change(s)`
+            : `Generic (no file changes recorded in session "${chosen.title || chosen.file}")`;
+        }
+      }
+
+      console.log(`\n${C.brightYellow}Generating timeline spanning ${days} days for project "${projName}" (${C.dim}${projDir}${C.reset}${C.brightYellow})...${C.reset}`);
+      console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
+
+      const changeSummaryLines = changes.length > 0
+        ? groupChangesByFile(changes, projDir).slice(0, 40).map(g => `- ${g.file} (${g.tools.join(', ')}, ${g.count}x)`).join('\n')
+        : '';
+
+      const prompt = changes.length > 0 ? `
+            You are helping organize real Claude Code work into ${count} progressive git commits for the project "${projName}" over ${days} days.
+            Here is the actual list of file modifications made by Claude Code during the selected session(s):
+            ${changeSummaryLines}
+
+            Group these real changes into a logical, chronological sequence of ${count} commits that accurately reflects the work actually done. Do not invent unrelated work.
+            Return a JSON array of Git commits in this format:
+            [{
+              "hash": "7-char hex",
+              "subject": "commit subject",
+              "body": "commit body details",
+              "timestamp": "relative or iso date string",
+              "author": "${gitAuthor}"
+            }]
+            Return ONLY the raw JSON array.
+          ` : `
             You are helping plan ${count} progressive commits for ${projName} over ${days} days.
             Return a JSON array of Git commits in this format:
             [{
@@ -429,7 +661,7 @@ async function main() {
               "subject": "commit subject",
               "body": "commit body details",
               "timestamp": "relative or iso date string",
-              "author": "Claude Code <claude@anthropic.com>"
+              "author": "${gitAuthor}"
             }]
             Return ONLY the raw JSON array.
           `;
@@ -459,14 +691,13 @@ async function main() {
       const claudeCliPath = isClaudeCliAvailable();
       if (claudeCliPath) {
         console.log(`${C.dim}✔ Local Claude Code CLI detected (at ${claudeCliPath}) — consulting it directly...${C.reset}`);
+        console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
         try {
-          const raw = execFileSync('claude', ['-p', prompt, '--output-format', 'json'], {
-            cwd: projDir,
-            encoding: 'utf-8',
-            maxBuffer: 10 * 1024 * 1024
+          const text = await runClaudeCliStreaming(prompt, projDir, (chunk) => {
+            process.stdout.write(`${C.dim}${chunk}${C.reset}`);
           });
-          const parsed = JSON.parse(raw);
-          const text = parsed.result ?? parsed.content ?? '';
+          process.stdout.write('\n');
+          console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
           commits = parseJsonCommits(text);
           intelligent = true;
           method = 'Claude Code CLI (local)';
@@ -528,10 +759,14 @@ async function main() {
       }
 
       if (!commits) {
-        commits = generateProceduralCommits(count, projName);
+        commits = changes.length > 0
+          ? generateProceduralCommitsFromChanges(changes, count, projName, projDir)
+          : generateProceduralCommits(count, projName);
         intelligent = false;
         method = 'Procedural (offline generator)';
       }
+
+      commits = commits.map((c: any) => ({ ...c, author: gitAuthor }));
 
       printCommits(commits, intelligent, method);
 

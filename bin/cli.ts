@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as os from 'os';
+import { diffLines } from 'diff';
 
 // ANSI escape codes for styling
 const C = {
@@ -254,6 +255,7 @@ function groupChangesByFile(changes: FileChange[], baseDir: string): { file: str
 interface CommitUnit {
   file: string;     // path relative to the project dir
   absPath: string;  // absolute path on disk
+  before: string;   // content right before this transition (for further line-level splitting)
   content: string;  // real file content at this point in history
   time: Date;
 }
@@ -262,6 +264,15 @@ interface CommitUnit {
 function readFileContentSafe(filePath: string): string | null {
   try {
     return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+// Read a file's content as it was in the last commit (HEAD), tolerating new/untracked files
+function getGitHeadContent(projDir: string, relFile: string): string | null {
+  try {
+    return execFileSync('git', ['show', `HEAD:${relFile.split(path.sep).join('/')}`], { cwd: projDir, stdio: 'pipe' }).toString();
   } catch {
     return null;
   }
@@ -326,34 +337,153 @@ function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null,
     // Each backup is the state right before the next tracked edit - i.e. the target state
     // for the transition that follows it chronologically.
     for (let i = 1; i < list.length; i++) {
-      units.push({ file: relFile, absPath, content: list[i].content, time: list[i].time });
+      units.push({ file: relFile, absPath, before: list[i - 1].content, content: list[i].content, time: list[i].time });
     }
 
     // Final transition: from the last backup to whatever is actually on disk right now.
     const current = readFileContentSafe(absPath);
     if (current !== null && current !== list[list.length - 1].content) {
-      units.push({ file: relFile, absPath, content: current, time: new Date() });
+      units.push({ file: relFile, absPath, before: list[list.length - 1].content, content: current, time: new Date() });
     } else if (list.length === 1) {
-      units.push({ file: relFile, absPath, content: list[0].content, time: list[0].time });
+      const before = getGitHeadContent(projDir, relFile) ?? list[0].content;
+      units.push({ file: relFile, absPath, before, content: list[0].content, time: list[0].time });
     }
   }
 
-  // Files the session touched but with no recoverable backup history: one unit, current content.
+  // Files the session touched but with no recoverable backup history: one unit, current content,
+  // diffed against the last committed (HEAD) version when available so it can still be split.
   const grouped = groupChangesByFile(fallbackChanges, projDir);
   for (const g of grouped) {
     if (versions.has(g.file)) continue;
     const absPath = path.join(projDir, g.file);
     const current = readFileContentSafe(absPath);
     if (current === null) continue;
+    const before = getGitHeadContent(projDir, g.file) ?? '';
     const lastTimestamp = fallbackChanges
       .filter(c => (path.isAbsolute(c.file) ? path.relative(projDir, c.file) : c.file) === g.file)
       .map(c => new Date(c.timestamp))
       .sort((a, b) => b.getTime() - a.getTime())[0] || new Date();
-    units.push({ file: g.file, absPath, content: current, time: lastTimestamp });
+    units.push({ file: g.file, absPath, before, content: current, time: lastTimestamp });
   }
 
   units.sort((a, b) => a.time.getTime() - b.time.getTime());
   return units;
+}
+
+// A single paired change step: replacing one old line with one new line (either side may be
+// absent for a pure addition or pure deletion). Pairing removals with additions line-by-line
+// avoids the ugly "delete everything, then add everything back" progression a naive flat
+// remove-then-add token stream would produce for a fully-rewritten block.
+type MicroStep =
+  | { kind: 'context'; text: string }
+  | { kind: 'change'; removeLine?: string; addLine?: string };
+
+function splitIntoLines(text: string): string[] {
+  return text.split(/(?<=\n)/).filter(l => l.length > 0);
+}
+
+function buildMicroSteps(before: string, after: string): MicroStep[] {
+  const parts = diffLines(before, after);
+  const steps: MicroStep[] = [];
+  let i = 0;
+  while (i < parts.length) {
+    const part = parts[i];
+    if (!part.added && !part.removed) {
+      steps.push({ kind: 'context', text: part.value });
+      i++;
+      continue;
+    }
+    let removedLines: string[] = [];
+    let addedLines: string[] = [];
+    if (parts[i]?.removed) {
+      removedLines = splitIntoLines(parts[i].value);
+      i++;
+    }
+    if (parts[i]?.added) {
+      addedLines = splitIntoLines(parts[i].value);
+      i++;
+    }
+    const pairCount = Math.max(removedLines.length, addedLines.length);
+    for (let k = 0; k < pairCount; k++) {
+      steps.push({ kind: 'change', removeLine: removedLines[k], addLine: addedLines[k] });
+    }
+  }
+  return steps;
+}
+
+// Reconstruct the document after the first `appliedCount` change-steps have "landed" - not-yet-applied
+// steps still show their old line, already-applied steps show their new line.
+function reconstructFromMicroSteps(steps: MicroStep[], appliedCount: number): string {
+  let seen = 0;
+  const out: string[] = [];
+  for (const s of steps) {
+    if (s.kind === 'context') {
+      out.push(s.text);
+      continue;
+    }
+    seen++;
+    if (seen <= appliedCount) {
+      if (s.addLine) out.push(s.addLine);
+    } else {
+      if (s.removeLine) out.push(s.removeLine);
+    }
+  }
+  return out.join('');
+}
+
+// Split a before -> after transition into up to `steps` real, cumulative intermediate states,
+// using a line-level diff so every intermediate state is an actual step toward the final content.
+// Capped at the number of changed lines - can't usefully split further than that.
+function splitContentIntoSteps(before: string, after: string, steps: number): string[] {
+  if (steps <= 1 || before === after) return [after];
+  const microSteps = buildMicroSteps(before, after);
+  const totalChanges = microSteps.filter(s => s.kind === 'change').length;
+  if (totalChanges === 0) return [after];
+
+  const effectiveSteps = Math.min(steps, totalChanges);
+  const result: string[] = [];
+  for (let s = 1; s <= effectiveSteps; s++) {
+    const appliedCount = Math.round((s / effectiveSteps) * totalChanges);
+    result.push(reconstructFromMicroSteps(microSteps, appliedCount));
+  }
+  result[result.length - 1] = after; // guard against any rounding drift
+  return result;
+}
+
+// When there aren't enough natural change-units to reach the requested commit count, split the
+// largest available diffs line-by-line so we can still produce as many commits as were asked
+// for, up to the total amount of real changed lines available.
+function expandUnitsToCount(units: CommitUnit[], targetCount: number): CommitUnit[] {
+  if (units.length === 0 || units.length >= targetCount) return units;
+
+  const capacities = units.map(u => u.before === u.content ? 0 : buildMicroSteps(u.before, u.content).filter(s => s.kind === 'change').length);
+  const totalCapacity = capacities.reduce((a, b) => a + b, 0);
+  if (totalCapacity <= units.length) return units;
+
+  const desiredExtra = targetCount - units.length;
+  const result: CommitUnit[] = [];
+
+  units.forEach((u, idx) => {
+    const cap = capacities[idx];
+    if (cap <= 1) {
+      result.push(u);
+      return;
+    }
+    const share = Math.max(1, Math.round((cap / totalCapacity) * desiredExtra));
+    const steps = Math.min(cap, share + 1);
+    if (steps <= 1) {
+      result.push(u);
+      return;
+    }
+    const contents = splitContentIntoSteps(u.before, u.content, steps);
+    contents.forEach((c, i) => {
+      const staggerMs = (contents.length - 1 - i) * 1000;
+      const before = i === 0 ? u.before : contents[i - 1];
+      result.push({ file: u.file, absPath: u.absPath, before, content: c, time: new Date(u.time.getTime() - staggerMs) });
+    });
+  });
+
+  return result.sort((a, b) => a.time.getTime() - b.time.getTime());
 }
 
 // Distribute chronologically-ordered commit units into at most `count` contiguous buckets,
@@ -658,9 +788,12 @@ async function runCommitPlanner() {
 
   // Reconstruct the real, chronological progression of every touched file (using Claude Code's own
   // file-history backups where available) so a single file edited many times can become several real
-  // commits, not just one. The number of commits we can actually apply is capped by how many of
-  // these real change-units exist - align the requested count to that up front.
-  const commitUnits = changes.length > 0 ? buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes) : [];
+  // commits, not just one. If there still aren't enough natural change-units to hit the requested
+  // count, split the largest diffs line-by-line to get closer to it, up to how much real change exists.
+  let commitUnits = changes.length > 0 ? buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes) : [];
+  if (commitUnits.length > 0 && commitUnits.length < count) {
+    commitUnits = expandUnitsToCount(commitUnits, count);
+  }
   const effectiveCount = commitUnits.length > 0 ? Math.min(count, commitUnits.length) : count;
   const unitBuckets = commitUnits.length > 0 ? chunkUnitsIntoCommits(commitUnits, effectiveCount) : [];
 

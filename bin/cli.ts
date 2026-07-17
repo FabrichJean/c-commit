@@ -1,4 +1,4 @@
-import { execSync, spawn } from 'child_process';
+import { execSync, execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -277,12 +277,16 @@ function extractFileChanges(sessionFilePaths: string[]): FileChange[] {
   return changes;
 }
 
-// Group raw file changes by file (relative to the project dir) for display/prompt use
+// Group raw file changes by file (relative to the project dir) for display/prompt use.
+// Files outside the project dir (multi-project sessions) and unresolved paths are skipped,
+// since they can't be safely `git add`-ed from this repo.
 function groupChangesByFile(changes: FileChange[], baseDir: string): { file: string; tools: string[]; count: number }[] {
   const map = new Map<string, { tools: Set<string>; count: number }>();
 
   for (const c of changes) {
+    if (c.file === 'unknown file' || c.file === 'unknown notebook') continue;
     const key = path.isAbsolute(c.file) ? path.relative(baseDir, c.file) : c.file;
+    if (key.startsWith('..')) continue;
     if (!map.has(key)) map.set(key, { tools: new Set(), count: 0 });
     const entry = map.get(key)!;
     entry.tools.add(c.tool);
@@ -290,6 +294,39 @@ function groupChangesByFile(changes: FileChange[], baseDir: string): { file: str
   }
 
   return Array.from(map.entries()).map(([file, v]) => ({ file, tools: Array.from(v.tools), count: v.count }));
+}
+
+// Distribute grouped file changes as evenly as possible into at most `count` commit buckets
+function chunkFilesForCommits(grouped: { file: string }[], count: number): string[][] {
+  if (grouped.length === 0 || count <= 0) return [];
+  const bucketCount = Math.min(count, grouped.length);
+  const buckets: string[][] = Array.from({ length: bucketCount }, () => []);
+  grouped.forEach((g, i) => buckets[i % bucketCount].push(g.file));
+  return buckets;
+}
+
+// Stage and commit each file bucket as a real Git commit, in order
+function applyCommits(commits: any[], fileBuckets: string[][], projDir: string): { applied: number; errors: string[] } {
+  let applied = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < commits.length; i++) {
+    const files = fileBuckets[i];
+    if (!files || files.length === 0) {
+      errors.push(`Commit #${i + 1}: no real file(s) mapped, skipped.`);
+      continue;
+    }
+    try {
+      execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
+      execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe' });
+      applied++;
+    } catch (err: any) {
+      const message = (err.stderr?.toString() || err.message || '').split('\n')[0];
+      errors.push(`Commit #${i + 1} (${files.join(', ')}): ${message}`);
+    }
+  }
+
+  return { applied, errors };
 }
 
 // Check whether the local `claude` executable (Claude Code CLI) is installed and on PATH
@@ -301,6 +338,33 @@ function isClaudeCliAvailable(): string | null {
   } catch {
     return null;
   }
+}
+
+// Track how many terminal rows a chunk of text advances the cursor by, accounting for line wraps.
+// Uses relative cursor movement math (not absolute save/restore) so it stays correct even if the
+// terminal scrolls while long content streams in.
+function advanceRows(text: string, startCol: number, terminalWidth: number): { rows: number; endCol: number } {
+  let col = startCol;
+  let rows = 0;
+  for (const ch of text) {
+    if (ch === '\n') {
+      rows++;
+      col = 0;
+    } else {
+      col++;
+      if (col >= terminalWidth) {
+        rows++;
+        col = 0;
+      }
+    }
+  }
+  return { rows, endCol: col };
+}
+
+// Move the cursor back to the start of `rows` rows of previously-printed output and erase them
+function eraseRows(rows: number) {
+  if (rows > 0) process.stdout.write(`\x1b[${rows}A`);
+  process.stdout.write('\r\x1b[0J');
 }
 
 // Run the local Claude Code CLI in streaming mode, printing its output live as it's generated
@@ -692,16 +756,24 @@ async function main() {
       if (claudeCliPath) {
         console.log(`${C.dim}✔ Local Claude Code CLI detected (at ${claudeCliPath}) — consulting it directly...${C.reset}`);
         console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
+
+        const terminalWidth = process.stdout.columns || 80;
+        let liveRows = 0;
+        let liveCol = 0;
+
         try {
           const text = await runClaudeCliStreaming(prompt, projDir, (chunk) => {
             process.stdout.write(`${C.dim}${chunk}${C.reset}`);
+            const { rows, endCol } = advanceRows(chunk, liveCol, terminalWidth);
+            liveRows += rows;
+            liveCol = endCol;
           });
-          process.stdout.write('\n');
-          console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
+          eraseRows(liveRows);
           commits = parseJsonCommits(text);
           intelligent = true;
           method = 'Claude Code CLI (local)';
         } catch (err: any) {
+          eraseRows(liveRows);
           console.log(`${C.yellow}Local Claude Code CLI call failed: ${err.message}${C.reset}`);
         }
       }
@@ -769,6 +841,69 @@ async function main() {
       commits = commits.map((c: any) => ({ ...c, author: gitAuthor }));
 
       printCommits(commits, intelligent, method);
+
+      let readyToApply = changes.length > 0 && isGitRepo(projDir);
+
+      if (changes.length === 0) {
+        console.log(`${C.dim}(Apply option unavailable: these are generic suggestions with no real file mapping. Pick a session-based basis to enable applying.)${C.reset}`);
+      } else if (!isGitRepo(projDir)) {
+        console.log(`${C.yellow}${projDir} is not a Git repository yet.${C.reset}`);
+        const rawInit = await question(`Initialize a Git repository here now? (y/N): `);
+        if (rawInit.trim().toLowerCase() === 'y') {
+          try {
+            execFileSync('git', ['init'], { cwd: projDir, stdio: 'pipe' });
+
+            const authorMatch = gitAuthor.match(/^(.*?)\s*<([^>]+)>$/);
+            if (authorMatch) {
+              execFileSync('git', ['config', 'user.name', authorMatch[1]], { cwd: projDir, stdio: 'pipe' });
+              execFileSync('git', ['config', 'user.email', authorMatch[2]], { cwd: projDir, stdio: 'pipe' });
+            }
+
+            console.log(`${C.green}✔ Initialized empty Git repository in ${projDir}${C.reset}`);
+
+            const rawRemote = await question(`Add a Git remote URL now? (${C.dim}optional, press Enter to skip${C.reset}): `);
+            if (rawRemote.trim()) {
+              try {
+                execFileSync('git', ['remote', 'add', 'origin', rawRemote.trim()], { cwd: projDir, stdio: 'pipe' });
+                console.log(`${C.green}✔ Remote 'origin' set to ${rawRemote.trim()}${C.reset}`);
+              } catch (err: any) {
+                console.log(`${C.red}Failed to add remote: ${err.message}${C.reset}`);
+              }
+            }
+
+            readyToApply = true;
+          } catch (err: any) {
+            console.log(`${C.red}Failed to initialize Git repository: ${err.message}${C.reset}`);
+          }
+        } else {
+          console.log(`${C.dim}Skipped - no Git repository was initialized.${C.reset}`);
+        }
+      }
+
+      if (readyToApply) {
+        const fileGroups = groupChangesByFile(changes, projDir);
+        const fileBuckets = chunkFilesForCommits(fileGroups, commits.length);
+        commits = commits.map((c: any, i: number) => ({ ...c, files: fileBuckets[i] || [] }));
+
+        console.log(`${C.bold}Each commit above maps to these real file(s):${C.reset}`);
+        commits.forEach((c: any, idx: number) => {
+          console.log(`  [${idx + 1}] ${c.files.length > 0 ? c.files.join(', ') : `${C.dim}(no real files - will be skipped)${C.reset}`}`);
+        });
+
+        const rawApply = await question(`\n${C.brightRed}${C.bold}Apply these ${commits.length} commit(s) to the local Git repository now? (y/N): ${C.reset}`);
+        if (rawApply.trim().toLowerCase() === 'y') {
+          console.log(`\n${C.brightYellow}Applying commits...${C.reset}`);
+          const { applied, errors } = applyCommits(commits, fileBuckets, projDir);
+          console.log(`${C.green}✔ Applied ${applied}/${commits.length} commit(s).${C.reset}`);
+          if (errors.length > 0) {
+            console.log(`${C.red}Issues:${C.reset}`);
+            errors.forEach(e => console.log(`  - ${e}`));
+          }
+          console.log(`${C.dim}Review with: git log --oneline -n ${commits.length}${C.reset}`);
+        } else {
+          console.log(`${C.dim}Skipped - no commits were applied.${C.reset}`);
+        }
+      }
 
       await pressEnterToContinue();
     }

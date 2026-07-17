@@ -4,43 +4,25 @@ import * as path from 'path';
 import * as readline from 'readline';
 import * as os from 'os';
 
-// ANSI escape codes for stunning styling
+// ANSI escape codes for styling
 const C = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
   dim: '\x1b[2m',
   italic: '\x1b[3m',
   underline: '\x1b[4m',
-  blink: '\x1b[5m',
-  reverse: '\x1b[7m',
-  
-  // Foreground colors
-  black: '\x1b[30m',
+
   red: '\x1b[31m',
   green: '\x1b[32m',
   yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
   cyan: '\x1b[36m',
   white: '\x1b[37m',
-  
-  // High intensity
+
   brightRed: '\x1b[91m',
   brightGreen: '\x1b[92m',
   brightYellow: '\x1b[93m',
-  brightBlue: '\x1b[94m',
-  brightMagenta: '\x1b[95m',
   brightCyan: '\x1b[96m',
   brightWhite: '\x1b[97m',
-  
-  // Backgrounds
-  bgCyan: '\x1b[46m',
-  bgBlack: '\x1b[40m',
-  bgRed: '\x1b[41m',
-  bgGreen: '\x1b[42m',
-  bgYellow: '\x1b[43m',
-  bgBlue: '\x1b[44m',
-  bgMagenta: '\x1b[45m',
 };
 
 // Clear screen and reset cursor position
@@ -55,11 +37,6 @@ const rl = readline.createInterface({
 
 const question = (query: string): Promise<string> => {
   return new Promise((resolve) => rl.question(query, resolve));
-};
-
-const pressEnterToContinue = async () => {
-  process.stdout.write(`\n${C.dim}Press [ENTER] to return to Main Menu...${C.reset}`);
-  await question('');
 };
 
 // Check if Git is initialized in the given directory
@@ -169,28 +146,6 @@ function summarizeSession(filePath: string): SessionSummary {
   return { file: path.basename(filePath), filePath, mtime: stats.mtime, messageCount, title, firstUserMessage };
 }
 
-// Read the full user/assistant transcript out of a .jsonl session file
-function readSessionTranscript(filePath: string): { role: string; text: string; timestamp: string }[] {
-  const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
-  const transcript: { role: string; text: string; timestamp: string }[] = [];
-
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' || entry.type === 'assistant') {
-        const text = extractText(entry.message?.content);
-        if (text) {
-          transcript.push({ role: entry.type, text, timestamp: entry.timestamp });
-        }
-      }
-    } catch {
-      // Skip malformed lines
-    }
-  }
-
-  return transcript;
-}
-
 // Locate the Claude Code session folder for a given project and summarize its sessions
 function findProjectSessions(projDir: string): { claudeHome: string | null; sessionDir: string | null; summaries: SessionSummary[] } {
   const claudeHome = locateClaudeCodeDir();
@@ -296,33 +251,175 @@ function groupChangesByFile(changes: FileChange[], baseDir: string): { file: str
   return Array.from(map.entries()).map(([file, v]) => ({ file, tools: Array.from(v.tools), count: v.count }));
 }
 
-// Distribute grouped file changes as evenly as possible into at most `count` commit buckets
-function chunkFilesForCommits(grouped: { file: string }[], count: number): string[][] {
-  if (grouped.length === 0 || count <= 0) return [];
-  const bucketCount = Math.min(count, grouped.length);
-  const buckets: string[][] = Array.from({ length: bucketCount }, () => []);
-  grouped.forEach((g, i) => buckets[i % bucketCount].push(g.file));
+interface CommitUnit {
+  file: string;     // path relative to the project dir
+  absPath: string;  // absolute path on disk
+  content: string;  // real file content at this point in history
+  time: Date;
+}
+
+// Read a file's content, tolerating files that no longer exist
+function readFileContentSafe(filePath: string): string | null {
+  try {
+    return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+// Reconstruct the real, chronological sequence of file-content snapshots for a project using
+// Claude Code's own file-history backups (~/.claude/file-history/<sessionId>/<hash>@vN). This is
+// what lets a single file that was edited many times across a session become several real,
+// meaningful commits instead of being collapsed into one. Files with no recoverable backup
+// history fall back to a single unit using their current on-disk content.
+function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null, projDir: string, fallbackChanges: FileChange[]): CommitUnit[] {
+  const versions = new Map<string, { version: number; content: string; time: Date }[]>();
+
+  if (claudeHome) {
+    for (const sessionFilePath of sessionFilePaths) {
+      const sessionId = path.basename(sessionFilePath, '.jsonl');
+      const historyDir = path.join(claudeHome, 'file-history', sessionId);
+      if (!fs.existsSync(historyDir)) continue;
+
+      let lines: string[];
+      try {
+        lines = fs.readFileSync(sessionFilePath, 'utf-8').split('\n').filter(Boolean);
+      } catch {
+        continue;
+      }
+
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type !== 'file-history-snapshot') continue;
+          const backups = entry.snapshot?.trackedFileBackups;
+          if (!backups || typeof backups !== 'object') continue;
+
+          for (const [filePath, info] of Object.entries<any>(backups)) {
+            if (!info?.backupFileName) continue;
+            const absFile = path.isAbsolute(filePath) ? filePath : path.join(projDir, filePath);
+            const relFile = path.relative(projDir, absFile);
+            if (relFile.startsWith('..')) continue;
+
+            const content = readFileContentSafe(path.join(historyDir, info.backupFileName));
+            if (content === null) continue;
+
+            const list = versions.get(relFile) || [];
+            if (!list.some(v => v.version === info.version)) {
+              list.push({ version: info.version, content, time: new Date(info.backupTime || entry.snapshot?.timestamp) });
+              versions.set(relFile, list);
+            }
+          }
+        } catch {
+          // Skip malformed lines
+        }
+      }
+    }
+  }
+
+  const units: CommitUnit[] = [];
+
+  for (const [relFile, list] of versions.entries()) {
+    list.sort((a, b) => a.version - b.version);
+    const absPath = path.join(projDir, relFile);
+
+    // Each backup is the state right before the next tracked edit - i.e. the target state
+    // for the transition that follows it chronologically.
+    for (let i = 1; i < list.length; i++) {
+      units.push({ file: relFile, absPath, content: list[i].content, time: list[i].time });
+    }
+
+    // Final transition: from the last backup to whatever is actually on disk right now.
+    const current = readFileContentSafe(absPath);
+    if (current !== null && current !== list[list.length - 1].content) {
+      units.push({ file: relFile, absPath, content: current, time: new Date() });
+    } else if (list.length === 1) {
+      units.push({ file: relFile, absPath, content: list[0].content, time: list[0].time });
+    }
+  }
+
+  // Files the session touched but with no recoverable backup history: one unit, current content.
+  const grouped = groupChangesByFile(fallbackChanges, projDir);
+  for (const g of grouped) {
+    if (versions.has(g.file)) continue;
+    const absPath = path.join(projDir, g.file);
+    const current = readFileContentSafe(absPath);
+    if (current === null) continue;
+    const lastTimestamp = fallbackChanges
+      .filter(c => (path.isAbsolute(c.file) ? path.relative(projDir, c.file) : c.file) === g.file)
+      .map(c => new Date(c.timestamp))
+      .sort((a, b) => b.getTime() - a.getTime())[0] || new Date();
+    units.push({ file: g.file, absPath, content: current, time: lastTimestamp });
+  }
+
+  units.sort((a, b) => a.time.getTime() - b.time.getTime());
+  return units;
+}
+
+// Distribute chronologically-ordered commit units into at most `count` contiguous buckets,
+// preserving order both within and across buckets.
+function chunkUnitsIntoCommits(units: CommitUnit[], count: number): CommitUnit[][] {
+  if (units.length === 0 || count <= 0) return [];
+  const bucketCount = Math.min(count, units.length);
+  const perBucket = Math.ceil(units.length / bucketCount);
+  const buckets: CommitUnit[][] = Array.from({ length: bucketCount }, () => []);
+  units.forEach((u, i) => {
+    const idx = Math.min(Math.floor(i / perBucket), bucketCount - 1);
+    buckets[idx].push(u);
+  });
   return buckets;
 }
 
-// Stage and commit each file bucket as a real Git commit, in order
-function applyCommits(commits: any[], fileBuckets: string[][], projDir: string): { applied: number; errors: string[] } {
+// Write each bucket's real historical file content, commit it, and move on - reconstructing the
+// actual progression of the work. Every touched file is guaranteed to be left at its true current
+// content on disk when this returns, even if a commit fails partway through.
+function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], projDir: string): { applied: number; errors: string[] } {
   let applied = 0;
   const errors: string[] = [];
 
-  for (let i = 0; i < commits.length; i++) {
-    const files = fileBuckets[i];
-    if (!files || files.length === 0) {
-      errors.push(`Commit #${i + 1}: no real file(s) mapped, skipped.`);
-      continue;
+  const restoreMap = new Map<string, string | null>();
+  for (const bucket of unitBuckets) {
+    for (const u of bucket) {
+      if (!restoreMap.has(u.absPath)) {
+        restoreMap.set(u.absPath, readFileContentSafe(u.absPath));
+      }
     }
-    try {
-      execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
-      execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe' });
-      applied++;
-    } catch (err: any) {
-      const message = (err.stderr?.toString() || err.message || '').split('\n')[0];
-      errors.push(`Commit #${i + 1} (${files.join(', ')}): ${message}`);
+  }
+
+  try {
+    for (let i = 0; i < commits.length; i++) {
+      const bucket = unitBuckets[i];
+      if (!bucket || bucket.length === 0) {
+        errors.push(`Commit #${i + 1}: no real file state mapped, skipped.`);
+        continue;
+      }
+
+      const latestPerFile = new Map<string, CommitUnit>();
+      for (const u of bucket) latestPerFile.set(u.absPath, u);
+
+      const files: string[] = [];
+      try {
+        for (const u of latestPerFile.values()) {
+          fs.writeFileSync(u.absPath, u.content, 'utf-8');
+          files.push(path.relative(projDir, u.absPath));
+        }
+        execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
+        execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe' });
+        applied++;
+      } catch (err: any) {
+        const message = (err.stderr?.toString() || err.message || '').split('\n')[0];
+        errors.push(`Commit #${i + 1} (${files.join(', ')}): ${message}`);
+      }
+    }
+  } finally {
+    for (const [absPath, content] of restoreMap.entries()) {
+      if (content !== null) {
+        try {
+          fs.writeFileSync(absPath, content, 'utf-8');
+        } catch {
+          // best effort
+        }
+      }
     }
   }
 
@@ -419,12 +516,12 @@ function generateProceduralCommits(count: number, projectName: string) {
   const stages = ["chore: init setup", "feat(db): schema definitions", "feat(core): core engines", "feat(ui): terminal renderer", "test: active validator specs"];
   const commits = [];
   const start = Date.now() - count * 24 * 60 * 60 * 1000;
-  
+
   for (let i = 0; i < count; i++) {
     const stage = stages[i % stages.length];
     const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toLocaleString();
     const hash = Math.random().toString(16).substring(2, 9);
-    
+
     commits.push({
       hash,
       subject: `${stage} - checkpoint progress #${i+1}`,
@@ -436,27 +533,353 @@ function generateProceduralCommits(count: number, projectName: string) {
   return commits;
 }
 
-// Offline fallback that groups real Claude Code file changes into commits (no AI required)
-function generateProceduralCommitsFromChanges(changes: FileChange[], count: number, projectName: string, projDir: string) {
-  const grouped = groupChangesByFile(changes, projDir);
-  const commits = [];
-  const start = Date.now() - count * 24 * 60 * 60 * 1000;
+// Offline fallback that turns real, chronologically-ordered commit-unit buckets into commits
+// (no AI required) - one commit per bucket, in the order the work actually happened.
+function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], projectName: string) {
+  const commits: any[] = [];
+  const start = Date.now() - unitBuckets.length * 24 * 60 * 60 * 1000;
 
-  for (let i = 0; i < count; i++) {
-    const group = grouped[i % grouped.length];
+  unitBuckets.forEach((bucket, i) => {
+    const files = Array.from(new Set(bucket.map(u => u.file)));
     const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toLocaleString();
     const hash = Math.random().toString(16).substring(2, 9);
-    const verb = group.tools.length === 1 && group.tools[0] === 'Write' ? 'add' : 'update';
+    const label = files.length === 1 ? files[0] : `${files.length} files`;
 
     commits.push({
       hash,
-      subject: `chore: ${verb} ${group.file}`,
-      body: `Based on ${group.count} real modification(s) made by Claude Code to ${group.file} (${group.tools.join(', ')}) in ${projectName}.`,
+      subject: `chore: update ${label}`,
+      body: `Reconstructed from ${bucket.length} real change(s) made by Claude Code to ${files.join(', ')} in ${projectName}.`,
       timestamp,
       author: "Claude Code <claude@anthropic.com>"
     });
-  }
+  });
   return commits;
+}
+
+// Print a plain bordered banner (no emoji, single accent color)
+function printBanner() {
+  const width = 74;
+  const title = 'Claude Commit Planner';
+  const subtitle = 'Generate and apply Git commit plans grounded in real Claude Code session history.';
+
+  const wrapLine = (text: string): string[] => {
+    const words = text.split(' ');
+    const lines: string[] = [];
+    let current = '';
+    for (const w of words) {
+      const next = current ? `${current} ${w}` : w;
+      if (next.length > width - 4) {
+        lines.push(current);
+        current = w;
+      } else {
+        current = next;
+      }
+    }
+    if (current) lines.push(current);
+    return lines;
+  };
+
+  const bodyLines = [title, '', ...wrapLine(subtitle)];
+
+  console.log(`${C.cyan}┌${'─'.repeat(width - 2)}┐${C.reset}`);
+  bodyLines.forEach((line, idx) => {
+    const styled = idx === 0 ? `${C.bold}${line}${C.reset}` : `${C.dim}${line}${C.reset}`;
+    const padding = ' '.repeat(Math.max(width - 4 - line.length, 0));
+    console.log(`${C.cyan}│${C.reset} ${styled}${padding} ${C.cyan}│${C.reset}`);
+  });
+  console.log(`${C.cyan}└${'─'.repeat(width - 2)}┘${C.reset}`);
+  console.log();
+
+  const claudeCliPath = isClaudeCliAvailable();
+  console.log(`  ${C.dim}Claude Code CLI${C.reset}   ${claudeCliPath ? `${C.green}Connected${C.reset} ${C.dim}(${claudeCliPath})${C.reset}` : `${C.yellow}Not found on PATH${C.reset}`}`);
+
+  const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.GEMINI_API_KEY;
+  console.log(`  ${C.dim}Credentials${C.reset}       ${apiKey ? `${C.green}Configured${C.reset}` : `${C.yellow}Not set${C.reset} ${C.dim}(procedural fallback will be used if needed)${C.reset}`}`);
+  console.log();
+}
+
+// Interactive commit-timeline planner: pick a project, ground it in real Claude Code
+// session data (optional), generate a commit plan, and optionally apply it as real commits.
+async function runCommitPlanner() {
+  const rawProjDir = await question(`Project folder (${C.dim}default: current directory${C.reset}): `);
+  const projDir = rawProjDir.trim().length > 0 ? resolvePath(rawProjDir) : process.cwd();
+
+  if (!fs.existsSync(projDir) || !fs.statSync(projDir).isDirectory()) {
+    console.log(`\n${C.red}Path does not exist or is not a directory: ${projDir}${C.reset}`);
+    return;
+  }
+
+  const projName = path.basename(projDir);
+  const gitAuthor = getGitAuthor(projDir);
+  const rawCount = await question(`How many commits would you like to suggest? (default: 5): `);
+  const count = parseInt(rawCount) || 5;
+
+  const rawDays = await question(`Over how many days of timeline history? (default: 3): `);
+  const days = parseInt(rawDays) || 3;
+
+  console.log(`\n${C.bold}Base suggestions on real Claude Code modifications?${C.reset}`);
+  console.log(`  1. A specific chat session`);
+  console.log(`  2. All sessions for this project (general)`);
+  console.log(`  3. No - generate generic suggestions`);
+  const rawBasis = await question(`Choice (default: 3): `);
+  const basisChoice = rawBasis.trim() || '3';
+
+  let changes: FileChange[] = [];
+  let sessionFilePaths: string[] = [];
+  let claudeHomeForUnits: string | null = null;
+  let basisLabel = 'Generic (no session data)';
+
+  if (basisChoice === '1' || basisChoice === '2') {
+    const sessions = findProjectSessions(projDir);
+    claudeHomeForUnits = sessions.claudeHome;
+    if (!sessions.claudeHome || !sessions.sessionDir || sessions.summaries.length === 0) {
+      console.log(`${C.yellow}No Claude Code chat history found for this project - falling back to generic suggestions.${C.reset}`);
+    } else if (basisChoice === '2') {
+      sessionFilePaths = sessions.summaries.map(s => s.filePath);
+      changes = extractFileChanges(sessionFilePaths);
+      basisLabel = changes.length > 0
+        ? `General - ${sessions.summaries.length} session(s), ${changes.length} file change(s)`
+        : 'Generic (no file changes recorded across sessions)';
+    } else {
+      console.log(`\n${C.bold}Available sessions:${C.reset}`);
+      sessions.summaries.forEach((s, idx) => {
+        console.log(`  ${C.bold}${idx + 1}.${C.reset} ${s.title || '(untitled session)'} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
+      });
+      const rawPick = await question(`\nSession number (${C.dim}default: most recent${C.reset}): `);
+      const pick = parseInt(rawPick.trim());
+      const chosen = (!isNaN(pick) && pick >= 1 && pick <= sessions.summaries.length) ? sessions.summaries[pick - 1] : sessions.summaries[0];
+      sessionFilePaths = [chosen.filePath];
+      changes = extractFileChanges(sessionFilePaths);
+      basisLabel = changes.length > 0
+        ? `Session "${chosen.title || chosen.file}" - ${changes.length} file change(s)`
+        : `Generic (no file changes recorded in session "${chosen.title || chosen.file}")`;
+    }
+  }
+
+  // Reconstruct the real, chronological progression of every touched file (using Claude Code's own
+  // file-history backups where available) so a single file edited many times can become several real
+  // commits, not just one. The number of commits we can actually apply is capped by how many of
+  // these real change-units exist - align the requested count to that up front.
+  const commitUnits = changes.length > 0 ? buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes) : [];
+  const effectiveCount = commitUnits.length > 0 ? Math.min(count, commitUnits.length) : count;
+  const unitBuckets = commitUnits.length > 0 ? chunkUnitsIntoCommits(commitUnits, effectiveCount) : [];
+
+  console.log(`\n${C.dim}Generating a ${effectiveCount}-commit plan spanning ${days} day(s) for "${projName}"...${C.reset}`);
+  console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
+  if (effectiveCount !== count) {
+    console.log(`${C.yellow}Only ${commitUnits.length} real change(s) were recovered, so the plan is capped at ${effectiveCount} commit(s) instead of the requested ${count} (each commit needs a real change to apply).${C.reset}`);
+  }
+
+  const changeSummaryLines = unitBuckets.length > 0
+    ? unitBuckets.map((bucket, i) => {
+        const files = Array.from(new Set(bucket.map(u => u.file)));
+        const when = bucket[bucket.length - 1].time.toLocaleString();
+        return `Commit ${i + 1}: ${files.join(', ')} (${bucket.length} change(s), around ${when})`;
+      }).join('\n')
+    : '';
+
+  const prompt = changes.length > 0 ? `
+        You are writing ${effectiveCount} git commit messages (subject + body only) describing real work Claude Code did on "${projName}" over ${days} days.
+        The commits are already grouped and ordered for you from the real file-change history - keep this exact order and grouping, do not add, remove, merge, or reorder commits:
+        ${changeSummaryLines}
+
+        Write a clear, specific subject and body for each commit reflecting what actually changed in that group.
+        Return a JSON array of Git commits in this format:
+        [{
+          "hash": "7-char hex",
+          "subject": "commit subject",
+          "body": "commit body details",
+          "timestamp": "relative or iso date string",
+          "author": "${gitAuthor}"
+        }]
+        Return ONLY the raw JSON array.
+      ` : `
+        You are helping plan ${effectiveCount} progressive commits for ${projName} over ${days} days.
+        Return a JSON array of Git commits in this format:
+        [{
+          "hash": "7-char hex",
+          "subject": "commit subject",
+          "body": "commit body details",
+          "timestamp": "relative or iso date string",
+          "author": "${gitAuthor}"
+        }]
+        Return ONLY the raw JSON array.
+      `;
+
+  const parseJsonCommits = (text: string) => {
+    const cleanText = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+    return JSON.parse(cleanText);
+  };
+
+  const printCommits = (commits: any[], intelligent: boolean, method: string) => {
+    console.log(`\n${C.green}Generated ${commits.length} ${intelligent ? 'intelligent' : 'chronological'} commits ${C.dim}(method: ${C.reset}${C.bold}${method}${C.reset}${C.dim})${C.reset}\n`);
+    commits.forEach((c: any, idx: number) => {
+      console.log(`${C.brightCyan}${C.bold}Commit ${idx + 1}${C.reset}`);
+      console.log(`  ${C.bold}Hash:   ${C.reset}${C.brightYellow}${c.hash}${C.reset}`);
+      console.log(`  ${C.bold}Subject:${C.reset} ${C.white}${c.subject}${C.reset}`);
+      console.log(`  ${C.bold}Body:   ${C.reset}${C.dim}${c.body}${C.reset}`);
+      console.log(`  ${C.bold}Date:   ${C.reset}${c.timestamp}`);
+      if (c.author) console.log(`  ${C.bold}Author: ${C.reset}${c.author}`);
+      console.log();
+    });
+  };
+
+  let commits: any[] | null = null;
+  let intelligent = false;
+  let method = 'Procedural (offline generator)';
+
+  const claudeCliPath = isClaudeCliAvailable();
+  if (claudeCliPath) {
+    console.log(`${C.dim}Local Claude Code CLI detected (${claudeCliPath}) - consulting it directly...${C.reset}`);
+    console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
+
+    const terminalWidth = process.stdout.columns || 80;
+    let liveRows = 0;
+    let liveCol = 0;
+
+    try {
+      const text = await runClaudeCliStreaming(prompt, projDir, (chunk) => {
+        process.stdout.write(`${C.dim}${chunk}${C.reset}`);
+        const { rows, endCol } = advanceRows(chunk, liveCol, terminalWidth);
+        liveRows += rows;
+        liveCol = endCol;
+      });
+      eraseRows(liveRows);
+      commits = parseJsonCommits(text);
+      intelligent = true;
+      method = 'Claude Code CLI (local)';
+    } catch (err: any) {
+      eraseRows(liveRows);
+      console.log(`${C.yellow}Local Claude Code CLI call failed: ${err.message}${C.reset}`);
+    }
+  }
+
+  if (!commits) {
+    const keySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY'
+      : process.env.CLAUDE_API_KEY ? 'CLAUDE_API_KEY'
+      : process.env.GEMINI_API_KEY ? 'GEMINI_API_KEY'
+      : null;
+
+    if (keySource) {
+      const key = process.env[keySource]!;
+      const isAnthropic = keySource === 'ANTHROPIC_API_KEY' || keySource === 'CLAUDE_API_KEY';
+      console.log(`${C.dim}Consulting AI planner via ${C.reset}${C.bold}${keySource}${C.reset}${C.dim}...${C.reset}`);
+      try {
+        let text = '';
+
+        if (isAnthropic) {
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": key,
+              "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify({
+              model: "claude-3-5-sonnet-20241022",
+              max_tokens: 2000,
+              messages: [{ role: "user", content: prompt }]
+            })
+          });
+          const data: any = await response.json();
+          text = data.content?.[0]?.text || '';
+        } else {
+          // Gemini API call
+          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { responseMimeType: "application/json" }
+            })
+          });
+          const data: any = await response.json();
+          text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        }
+
+        commits = parseJsonCommits(text);
+        intelligent = true;
+        method = keySource;
+      } catch (err: any) {
+        console.log(`${C.red}AI request failed: ${err.message}. Falling back to procedural timeline generator.${C.reset}`);
+      }
+    }
+  }
+
+  if (!commits) {
+    commits = unitBuckets.length > 0
+      ? generateProceduralCommitsFromUnits(unitBuckets, projName)
+      : generateProceduralCommits(effectiveCount, projName);
+    intelligent = false;
+    method = 'Procedural (offline generator)';
+  }
+
+  commits = commits.map((c: any) => ({ ...c, author: gitAuthor }));
+
+  printCommits(commits, intelligent, method);
+
+  let readyToApply = commitUnits.length > 0 && isGitRepo(projDir);
+
+  if (changes.length === 0) {
+    console.log(`${C.dim}(Apply unavailable: these are generic suggestions with no real file mapping. Pick a session-based basis to enable applying.)${C.reset}`);
+  } else if (commitUnits.length === 0) {
+    console.log(`${C.dim}(Apply unavailable: none of the recorded changes map to files inside this project folder.)${C.reset}`);
+  } else if (!isGitRepo(projDir)) {
+    console.log(`${C.yellow}${projDir} is not a Git repository yet.${C.reset}`);
+    const rawInit = await question(`Initialize a Git repository here now? (y/N): `);
+    if (rawInit.trim().toLowerCase() === 'y') {
+      try {
+        execFileSync('git', ['init'], { cwd: projDir, stdio: 'pipe' });
+
+        const authorMatch = gitAuthor.match(/^(.*?)\s*<([^>]+)>$/);
+        if (authorMatch) {
+          execFileSync('git', ['config', 'user.name', authorMatch[1]], { cwd: projDir, stdio: 'pipe' });
+          execFileSync('git', ['config', 'user.email', authorMatch[2]], { cwd: projDir, stdio: 'pipe' });
+        }
+
+        console.log(`${C.green}Initialized empty Git repository in ${projDir}${C.reset}`);
+
+        const rawRemote = await question(`Add a Git remote URL now? (${C.dim}optional, press Enter to skip${C.reset}): `);
+        if (rawRemote.trim()) {
+          try {
+            execFileSync('git', ['remote', 'add', 'origin', rawRemote.trim()], { cwd: projDir, stdio: 'pipe' });
+            console.log(`${C.green}Remote 'origin' set to ${rawRemote.trim()}${C.reset}`);
+          } catch (err: any) {
+            console.log(`${C.red}Failed to add remote: ${err.message}${C.reset}`);
+          }
+        }
+
+        readyToApply = true;
+      } catch (err: any) {
+        console.log(`${C.red}Failed to initialize Git repository: ${err.message}${C.reset}`);
+      }
+    } else {
+      console.log(`${C.dim}Skipped - no Git repository was initialized.${C.reset}`);
+    }
+  }
+
+  if (readyToApply) {
+    commits = commits.map((c: any, i: number) => ({ ...c, files: Array.from(new Set((unitBuckets[i] || []).map(u => u.file))) }));
+
+    console.log(`${C.bold}Each commit above maps to these real file(s):${C.reset}`);
+    commits.forEach((c: any, idx: number) => {
+      console.log(`  ${idx + 1}. ${c.files.length > 0 ? c.files.join(', ') : `${C.dim}(no real files - will be skipped)${C.reset}`}`);
+    });
+
+    const rawApply = await question(`\n${C.brightRed}${C.bold}Apply these ${commits.length} commit(s) to the local Git repository now? (y/N): ${C.reset}`);
+    if (rawApply.trim().toLowerCase() === 'y') {
+      console.log(`\n${C.dim}Applying commits (writing each real historical state, one commit at a time)...${C.reset}`);
+      const { applied, errors } = applyCommitUnits(commits, unitBuckets, projDir);
+      console.log(`${C.green}Applied ${applied}/${commits.length} commit(s).${C.reset}`);
+      if (errors.length > 0) {
+        console.log(`${C.red}Issues:${C.reset}`);
+        errors.forEach(e => console.log(`  - ${e}`));
+      }
+      console.log(`${C.dim}Review with: git log --oneline -n ${commits.length}${C.reset}`);
+    } else {
+      console.log(`${C.dim}Skipped - no commits were applied.${C.reset}`);
+    }
+  }
 }
 
 // Main logic
@@ -477,493 +900,23 @@ async function main() {
     });
   }
 
-  while (true) {
-    clearScreen();
-    
-    // Immersive cyber dashboard header
-    console.log(`${C.brightCyan}${C.bold}╒═════════════════════════════════════════════════════════════════════╕${C.reset}`);
-    console.log(`${C.brightCyan}${C.bold}│             🤖   CLAUDE CODE TUI COMPANION TERMINAL CLI   🤖        │${C.reset}`);
-    console.log(`${C.brightCyan}${C.bold}╘═════════════════════════════════════════════════════════════════════╛${C.reset}`);
-    
-    const activeDirName = path.basename(process.cwd()).toUpperCase();
-    console.log(`${C.dim}📁 ACTIVE DIRECTORY : ${C.reset}${C.brightWhite}${C.bold}${activeDirName}${C.reset}`);
-    console.log(`${C.dim}🌐 PLATFORM         : ${C.reset}${C.brightYellow}${os.type()} (${os.arch()})${C.reset}`);
-    
-    const claudeDir = locateClaudeCodeDir();
-    if (claudeDir) {
-      console.log(`${C.dim}🔌 CLAUDE CLI STATUS: ${C.reset}${C.green}${C.bold}CONNECTED${C.reset} ${C.dim}(at ${claudeDir})${C.reset}`);
-    } else {
-      console.log(`${C.dim}🔌 CLAUDE CLI STATUS: ${C.reset}${C.yellow}STANDALONE MODE${C.reset} ${C.dim}(Claude Code not found locally)${C.reset}`);
-    }
-    
-    const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.GEMINI_API_KEY;
-    if (apiKey) {
-      const isAnthropic = !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY);
-      console.log(`${C.dim}🔑 CREDENTIAL ENGINE: ${C.reset}${C.green}${C.bold}ACTIVE${C.reset} ${C.dim}(Type: ${isAnthropic ? 'Anthropic Claude' : 'Google Gemini'})${C.reset}`);
-    } else {
-      console.log(`${C.dim}🔑 CREDENTIAL ENGINE: ${C.reset}${C.red}${C.bold}OFFLINE${C.reset} ${C.dim}(using offline procedural generator)${C.reset}`);
-    }
-    console.log(`${C.dim}───────────────────────────────────────────────────────────────────────${C.reset}\n`);
+  clearScreen();
+  printBanner();
 
-    console.log(`${C.brightCyan}${C.bold}[1]${C.reset} 📁 Scan Local File Explorer & Git History`);
-    console.log(`${C.brightCyan}${C.bold}[2]${C.reset} 💬 Locate & Read Local Claude Code Sessions`);
-    console.log(`${C.brightCyan}${C.bold}[3]${C.reset} 📅 Interactive Git Commit Timeline Suggester`);
-    console.log(`${C.brightCyan}${C.bold}[4]${C.reset} ⚙️  Configure API Keys & Diagnostics`);
-    console.log(`${C.brightCyan}${C.bold}[5]${C.reset} 🌐 Launch Web-TUI Interactive Dashboard`);
-    console.log(`${C.brightRed}${C.bold}[6]${C.reset} ❌ Exit CLI\n`);
-    
-    const ans = await question(`${C.brightWhite}${C.bold}Select option [1-6]: ${C.reset}`);
-    const choice = ans.trim();
-
-    if (choice === '1') {
+  let again = true;
+  while (again) {
+    await runCommitPlanner();
+    const rawAgain = await question(`\n${C.dim}Generate another commit plan? (y/N): ${C.reset}`);
+    again = rawAgain.trim().toLowerCase() === 'y';
+    if (again) {
       clearScreen();
-      console.log(`${C.brightCyan}${C.bold}📁 SCAN LOCAL FILE EXPLORER & GIT HISTORY${C.reset}`);
-      console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-
-      const rawDir = await question(`Enter a folder path to scan (${C.dim}default: current directory${C.reset}): `);
-      const targetDir = rawDir.trim() ? resolvePath(rawDir) : process.cwd();
-
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}📁 SCANNING WORKSPACE AND LOCAL GIT STATUS...${C.reset}`);
-      console.log(`${C.dim}Target: ${C.reset}${C.brightWhite}${targetDir}${C.reset}\n`);
-
-      if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
-        console.log(`${C.red}⚠️ Path does not exist or is not a directory.${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      if (!isGitRepo(targetDir)) {
-        console.log(`${C.yellow}⚠️ Warning: Target directory is not a Git repository.${C.reset}`);
-      } else {
-        try {
-          const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: targetDir }).toString().trim();
-          console.log(`${C.bold}Branch: ${C.reset}${C.cyan}${branch}${C.reset}`);
-
-          console.log(`\n${C.bold}Recent Git Commits:${C.reset}`);
-          const log = execSync('git log -n 5 --oneline', { cwd: targetDir }).toString().trim();
-          console.log(log ? log : `${C.dim}No commits found.${C.reset}`);
-
-          console.log(`\n${C.bold}Uncommitted changes (git status):${C.reset}`);
-          const status = execSync('git status --short', { cwd: targetDir }).toString().trim();
-          console.log(status ? `${C.brightYellow}${status}${C.reset}` : `${C.green}Your workspace is clean!${C.reset}`);
-        } catch (err: any) {
-          console.log(`${C.red}Failed to execute Git commands: ${err.message}${C.reset}`);
-        }
-      }
-
-      console.log(`\n${C.bold}Root Files & Sizes:${C.reset}`);
-      try {
-        const files = fs.readdirSync(targetDir);
-        files.slice(0, 15).forEach(f => {
-          if (f === 'node_modules' || f === '.git' || f === 'dist') return;
-          const stats = fs.statSync(path.join(targetDir, f));
-          const sizeKb = (stats.size / 1024).toFixed(1);
-          console.log(`  ${stats.isDirectory() ? `${C.brightCyan}DIR ` : `${C.brightGreen}FILE`} ${sizeKb.padStart(6)}K${C.reset}  ${f}`);
-        });
-        if (files.length > 15) {
-          console.log(`  ${C.dim}... and ${files.length - 15} more files${C.reset}`);
-        }
-      } catch (err: any) {
-        console.log(`${C.red}Failed to list files: ${err.message}${C.reset}`);
-      }
-
-      await pressEnterToContinue();
-    }
-    else if (choice === '2') {
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}💬 LOCATE & READ LOCAL CLAUDE CODE SESSIONS${C.reset}`);
-      console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-
-      const rawProjDir = await question(`Which project folder's chat history do you want to view? (${C.dim}default: current directory${C.reset}): `);
-      const targetProj = rawProjDir.trim().length > 0 ? resolvePath(rawProjDir) : process.cwd();
-
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}💬 SEARCHING FOR LOCAL CLAUDE CODE CHAT RECORDS...${C.reset}`);
-      console.log(`${C.dim}Project: ${C.reset}${C.brightWhite}${targetProj}${C.reset}\n`);
-
-      if (!fs.existsSync(targetProj) || !fs.statSync(targetProj).isDirectory()) {
-        console.log(`${C.red}⚠️ Path does not exist or is not a directory.${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      const { claudeHome, sessionDir, summaries } = findProjectSessions(targetProj);
-      if (!claudeHome) {
-        console.log(`${C.yellow}No local Claude Code config folder found.${C.reset}`);
-        console.log(`Claude Code typically stores persistent session cache in:`);
-        console.log(`  - macOS: ~/Library/Application Support/claude-code/`);
-        console.log(`  - Linux: ~/.config/claude-code/ or ~/.claude/`);
-        console.log(`  - Windows: %APPDATA%\\claude-code\\`);
-        console.log(`\n${C.dim}Tip: Make sure you have installed Claude Code globally via:${C.reset}`);
-        console.log(`  ${C.brightCyan}npm i -g @anthropic-ai/claude-code${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      if (!sessionDir) {
-        console.log(`${C.yellow}No chat history found for this project.${C.reset}`);
-        console.log(`${C.dim}(Looked in: ${path.join(claudeHome, 'projects', encodeProjectPath(targetProj))})${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      if (summaries.length === 0) {
-        console.log(`${C.yellow}No chat sessions found for this project.${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      console.log(`${C.green}✔ Found ${summaries.length} chat session(s):${C.reset}\n`);
-      summaries.forEach((s, idx) => {
-        console.log(`${C.brightCyan}${C.bold}[${idx + 1}]${C.reset} ${C.bold}${C.white}${s.title || '(untitled session)'}${C.reset} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
-        console.log(`    ${C.dim}"${s.firstUserMessage || '(no user message)'}"${C.reset}`);
-      });
-
-      const rawPick = await question(`\nEnter a session number to view its transcript (${C.dim}or press Enter to skip${C.reset}): `);
-      const pick = parseInt(rawPick.trim());
-
-      if (!isNaN(pick) && pick >= 1 && pick <= summaries.length) {
-        const chosen = summaries[pick - 1];
-        const transcript = readSessionTranscript(chosen.filePath);
-
-        console.log(`\n${C.brightCyan}${C.bold}📜 TRANSCRIPT: ${chosen.title || chosen.file}${C.reset}`);
-        console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-        transcript.forEach(m => {
-          const roleColor = m.role === 'user' ? C.brightYellow : C.brightGreen;
-          const roleLabel = m.role === 'user' ? 'USER' : 'CLAUDE';
-          console.log(`${roleColor}${C.bold}[${roleLabel}]${C.reset} ${C.dim}${new Date(m.timestamp).toLocaleString()}${C.reset}`);
-          console.log(`${m.text}\n`);
-        });
-      }
-
-      await pressEnterToContinue();
-    }
-    else if (choice === '3') {
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}📅 INTERACTIVE GIT COMMIT TIMELINE SUGGESTER${C.reset}`);
-      console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-      
-      const rawProjDir = await question(`Enter a project folder path (${C.dim}default: current directory${C.reset}): `);
-      const projDir = rawProjDir.trim().length > 0 ? resolvePath(rawProjDir) : process.cwd();
-
-      if (!fs.existsSync(projDir) || !fs.statSync(projDir).isDirectory()) {
-        console.log(`\n${C.red}⚠️ Path does not exist or is not a directory: ${projDir}${C.reset}`);
-        await pressEnterToContinue();
-        continue;
-      }
-
-      const projName = path.basename(projDir);
-      const gitAuthor = getGitAuthor(projDir);
-      const rawCount = await question(`How many commits would you like to suggest? (default: 5): `);
-      const count = parseInt(rawCount) || 5;
-
-      const rawDays = await question(`Over how many days of timeline history? (default: 3): `);
-      const days = parseInt(rawDays) || 3;
-
-      console.log(`\n${C.bold}Base suggestions on real Claude Code modifications?${C.reset}`);
-      console.log(`  [1] A specific chat session`);
-      console.log(`  [2] All sessions for this project (general)`);
-      console.log(`  [3] No - generate generic suggestions`);
-      const rawBasis = await question(`Choice (default: 3): `);
-      const basisChoice = rawBasis.trim() || '3';
-
-      let changes: FileChange[] = [];
-      let basisLabel = 'Generic (no session data)';
-
-      if (basisChoice === '1' || basisChoice === '2') {
-        const sessions = findProjectSessions(projDir);
-        if (!sessions.claudeHome || !sessions.sessionDir || sessions.summaries.length === 0) {
-          console.log(`${C.yellow}No Claude Code chat history found for this project — falling back to generic suggestions.${C.reset}`);
-        } else if (basisChoice === '2') {
-          changes = extractFileChanges(sessions.summaries.map(s => s.filePath));
-          basisLabel = changes.length > 0
-            ? `General - ${sessions.summaries.length} session(s), ${changes.length} file change(s)`
-            : 'Generic (no file changes recorded across sessions)';
-        } else {
-          console.log(`\n${C.bold}Available sessions:${C.reset}`);
-          sessions.summaries.forEach((s, idx) => {
-            console.log(`${C.brightCyan}${C.bold}[${idx + 1}]${C.reset} ${C.white}${s.title || '(untitled session)'}${C.reset} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
-          });
-          const rawPick = await question(`\nEnter a session number (${C.dim}default: most recent${C.reset}): `);
-          const pick = parseInt(rawPick.trim());
-          const chosen = (!isNaN(pick) && pick >= 1 && pick <= sessions.summaries.length) ? sessions.summaries[pick - 1] : sessions.summaries[0];
-          changes = extractFileChanges([chosen.filePath]);
-          basisLabel = changes.length > 0
-            ? `Session "${chosen.title || chosen.file}" - ${changes.length} file change(s)`
-            : `Generic (no file changes recorded in session "${chosen.title || chosen.file}")`;
-        }
-      }
-
-      console.log(`\n${C.brightYellow}Generating timeline spanning ${days} days for project "${projName}" (${C.dim}${projDir}${C.reset}${C.brightYellow})...${C.reset}`);
-      console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
-
-      const changeSummaryLines = changes.length > 0
-        ? groupChangesByFile(changes, projDir).slice(0, 40).map(g => `- ${g.file} (${g.tools.join(', ')}, ${g.count}x)`).join('\n')
-        : '';
-
-      const prompt = changes.length > 0 ? `
-            You are helping organize real Claude Code work into ${count} progressive git commits for the project "${projName}" over ${days} days.
-            Here is the actual list of file modifications made by Claude Code during the selected session(s):
-            ${changeSummaryLines}
-
-            Group these real changes into a logical, chronological sequence of ${count} commits that accurately reflects the work actually done. Do not invent unrelated work.
-            Return a JSON array of Git commits in this format:
-            [{
-              "hash": "7-char hex",
-              "subject": "commit subject",
-              "body": "commit body details",
-              "timestamp": "relative or iso date string",
-              "author": "${gitAuthor}"
-            }]
-            Return ONLY the raw JSON array.
-          ` : `
-            You are helping plan ${count} progressive commits for ${projName} over ${days} days.
-            Return a JSON array of Git commits in this format:
-            [{
-              "hash": "7-char hex",
-              "subject": "commit subject",
-              "body": "commit body details",
-              "timestamp": "relative or iso date string",
-              "author": "${gitAuthor}"
-            }]
-            Return ONLY the raw JSON array.
-          `;
-
-      const parseJsonCommits = (text: string) => {
-        const cleanText = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-        return JSON.parse(cleanText);
-      };
-
-      const printCommits = (commits: any[], intelligent: boolean, method: string) => {
-        console.log(`\n${C.green}✔ Generated ${commits.length} ${intelligent ? 'intelligent' : 'chronological'} commits ${C.dim}(method: ${C.reset}${C.bold}${method}${C.reset}${C.dim})${C.reset}\n`);
-        commits.forEach((c: any, idx: number) => {
-          console.log(`${C.brightCyan}${C.bold}[COMMIT #${idx+1}]${C.reset}`);
-          console.log(`  ${C.bold}Hash:   ${C.reset}${C.brightYellow}${c.hash}${C.reset}`);
-          console.log(`  ${C.bold}Subject:${C.reset} ${C.white}${c.subject}${C.reset}`);
-          console.log(`  ${C.bold}Body:   ${C.reset}${C.dim}${c.body}${C.reset}`);
-          console.log(`  ${C.bold}Date:   ${C.reset}${C.magenta}${c.timestamp}${C.reset}`);
-          if (c.author) console.log(`  ${C.bold}Author: ${C.reset}${c.author}`);
-          console.log();
-        });
-      };
-
-      let commits: any[] | null = null;
-      let intelligent = false;
-      let method = 'Procedural (offline generator)';
-
-      const claudeCliPath = isClaudeCliAvailable();
-      if (claudeCliPath) {
-        console.log(`${C.dim}✔ Local Claude Code CLI detected (at ${claudeCliPath}) — consulting it directly...${C.reset}`);
-        console.log(`${C.dim}----------------------------------------------------------------------${C.reset}`);
-
-        const terminalWidth = process.stdout.columns || 80;
-        let liveRows = 0;
-        let liveCol = 0;
-
-        try {
-          const text = await runClaudeCliStreaming(prompt, projDir, (chunk) => {
-            process.stdout.write(`${C.dim}${chunk}${C.reset}`);
-            const { rows, endCol } = advanceRows(chunk, liveCol, terminalWidth);
-            liveRows += rows;
-            liveCol = endCol;
-          });
-          eraseRows(liveRows);
-          commits = parseJsonCommits(text);
-          intelligent = true;
-          method = 'Claude Code CLI (local)';
-        } catch (err: any) {
-          eraseRows(liveRows);
-          console.log(`${C.yellow}Local Claude Code CLI call failed: ${err.message}${C.reset}`);
-        }
-      }
-
-      if (!commits) {
-        const keySource = process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY'
-          : process.env.CLAUDE_API_KEY ? 'CLAUDE_API_KEY'
-          : process.env.GEMINI_API_KEY ? 'GEMINI_API_KEY'
-          : null;
-
-        if (keySource) {
-          const key = process.env[keySource]!;
-          const isAnthropic = keySource === 'ANTHROPIC_API_KEY' || keySource === 'CLAUDE_API_KEY';
-          console.log(`${C.dim}Consulting AI Planner via ${C.reset}${C.bold}${keySource}${C.reset}${C.dim} for intelligent chronological progression...${C.reset}`);
-          try {
-            let text = '';
-
-            if (isAnthropic) {
-              const response = await fetch("https://api.anthropic.com/v1/messages", {
-                method: "POST",
-                headers: {
-                  "content-type": "application/json",
-                  "x-api-key": key,
-                  "anthropic-version": "2023-06-01"
-                },
-                body: JSON.stringify({
-                  model: "claude-3-5-sonnet-20241022",
-                  max_tokens: 2000,
-                  messages: [{ role: "user", content: prompt }]
-                })
-              });
-              const data: any = await response.json();
-              text = data.content?.[0]?.text || '';
-            } else {
-              // Gemini API call
-              const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                  contents: [{ parts: [{ text: prompt }] }],
-                  generationConfig: { responseMimeType: "application/json" }
-                })
-              });
-              const data: any = await response.json();
-              text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            }
-
-            commits = parseJsonCommits(text);
-            intelligent = true;
-            method = keySource;
-          } catch (err: any) {
-            console.log(`${C.red}AI request failed: ${err.message}. Falling back to procedural timeline generator.${C.reset}`);
-          }
-        }
-      }
-
-      if (!commits) {
-        commits = changes.length > 0
-          ? generateProceduralCommitsFromChanges(changes, count, projName, projDir)
-          : generateProceduralCommits(count, projName);
-        intelligent = false;
-        method = 'Procedural (offline generator)';
-      }
-
-      commits = commits.map((c: any) => ({ ...c, author: gitAuthor }));
-
-      printCommits(commits, intelligent, method);
-
-      let readyToApply = changes.length > 0 && isGitRepo(projDir);
-
-      if (changes.length === 0) {
-        console.log(`${C.dim}(Apply option unavailable: these are generic suggestions with no real file mapping. Pick a session-based basis to enable applying.)${C.reset}`);
-      } else if (!isGitRepo(projDir)) {
-        console.log(`${C.yellow}${projDir} is not a Git repository yet.${C.reset}`);
-        const rawInit = await question(`Initialize a Git repository here now? (y/N): `);
-        if (rawInit.trim().toLowerCase() === 'y') {
-          try {
-            execFileSync('git', ['init'], { cwd: projDir, stdio: 'pipe' });
-
-            const authorMatch = gitAuthor.match(/^(.*?)\s*<([^>]+)>$/);
-            if (authorMatch) {
-              execFileSync('git', ['config', 'user.name', authorMatch[1]], { cwd: projDir, stdio: 'pipe' });
-              execFileSync('git', ['config', 'user.email', authorMatch[2]], { cwd: projDir, stdio: 'pipe' });
-            }
-
-            console.log(`${C.green}✔ Initialized empty Git repository in ${projDir}${C.reset}`);
-
-            const rawRemote = await question(`Add a Git remote URL now? (${C.dim}optional, press Enter to skip${C.reset}): `);
-            if (rawRemote.trim()) {
-              try {
-                execFileSync('git', ['remote', 'add', 'origin', rawRemote.trim()], { cwd: projDir, stdio: 'pipe' });
-                console.log(`${C.green}✔ Remote 'origin' set to ${rawRemote.trim()}${C.reset}`);
-              } catch (err: any) {
-                console.log(`${C.red}Failed to add remote: ${err.message}${C.reset}`);
-              }
-            }
-
-            readyToApply = true;
-          } catch (err: any) {
-            console.log(`${C.red}Failed to initialize Git repository: ${err.message}${C.reset}`);
-          }
-        } else {
-          console.log(`${C.dim}Skipped - no Git repository was initialized.${C.reset}`);
-        }
-      }
-
-      if (readyToApply) {
-        const fileGroups = groupChangesByFile(changes, projDir);
-        const fileBuckets = chunkFilesForCommits(fileGroups, commits.length);
-        commits = commits.map((c: any, i: number) => ({ ...c, files: fileBuckets[i] || [] }));
-
-        console.log(`${C.bold}Each commit above maps to these real file(s):${C.reset}`);
-        commits.forEach((c: any, idx: number) => {
-          console.log(`  [${idx + 1}] ${c.files.length > 0 ? c.files.join(', ') : `${C.dim}(no real files - will be skipped)${C.reset}`}`);
-        });
-
-        const rawApply = await question(`\n${C.brightRed}${C.bold}Apply these ${commits.length} commit(s) to the local Git repository now? (y/N): ${C.reset}`);
-        if (rawApply.trim().toLowerCase() === 'y') {
-          console.log(`\n${C.brightYellow}Applying commits...${C.reset}`);
-          const { applied, errors } = applyCommits(commits, fileBuckets, projDir);
-          console.log(`${C.green}✔ Applied ${applied}/${commits.length} commit(s).${C.reset}`);
-          if (errors.length > 0) {
-            console.log(`${C.red}Issues:${C.reset}`);
-            errors.forEach(e => console.log(`  - ${e}`));
-          }
-          console.log(`${C.dim}Review with: git log --oneline -n ${commits.length}${C.reset}`);
-        } else {
-          console.log(`${C.dim}Skipped - no commits were applied.${C.reset}`);
-        }
-      }
-
-      await pressEnterToContinue();
-    }
-    else if (choice === '4') {
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}⚙️ CONFIGURE API KEYS & DIAGNOSTICS${C.reset}`);
-      console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-      
-      console.log(`Active Environment variables:`);
-      console.log(`  - ANTHROPIC_API_KEY: ${process.env.ANTHROPIC_API_KEY ? `${C.green}SET (Ends in ...${process.env.ANTHROPIC_API_KEY.slice(-4)})${C.reset}` : `${C.red}NOT SET${C.reset}`}`);
-      console.log(`  - CLAUDE_API_KEY:    ${process.env.CLAUDE_API_KEY ? `${C.green}SET (Ends in ...${process.env.CLAUDE_API_KEY.slice(-4)})${C.reset}` : `${C.red}NOT SET${C.reset}`}`);
-      console.log(`  - GEMINI_API_KEY:    ${process.env.GEMINI_API_KEY ? `${C.green}SET (Ends in ...${process.env.GEMINI_API_KEY.slice(-4)})${C.reset}` : `${C.red}NOT SET${C.reset}`}`);
-      
-      console.log(`\n${C.bold}To modify these keys, set them in your terminal:${C.reset}`);
-      console.log(`  Windows: ${C.cyan}set ANTHROPIC_API_KEY=your_key${C.reset}`);
-      console.log(`  macOS/Linux: ${C.cyan}export ANTHROPIC_API_KEY="your_key"${C.reset}`);
-      console.log(`Or define them in a local ${C.bold}.env${C.reset} file in this directory.`);
-      
-      await pressEnterToContinue();
-    } 
-    else if (choice === '5') {
-      clearScreen();
-      console.log(`${C.brightCyan}${C.bold}🌐 SPINNING UP LOCAL WEB-TUI COMPANION SERVER...${C.reset}`);
-      console.log(`${C.dim}----------------------------------------------------------------------${C.reset}\n`);
-      
-      console.log(`This starts the backend unifier Express server serving the React Web TUI.`);
-      console.log(`Once running, you can connect your browser to:`);
-      console.log(`  ${C.brightCyan}${C.bold}http://localhost:3000${C.reset}\n`);
-      
-      console.log(`${C.brightYellow}Tip: Run "npm run dev" or "npm run start" to boot the server easily!${C.reset}`);
-      console.log(`Starting background server process diagnostic...`);
-      
-      try {
-        const net = require('net');
-        const tester = net.createServer()
-          .once('error', (err: any) => {
-            if (err.code === 'EADDRINUSE') {
-              console.log(`${C.green}✔ Port 3000 is currently occupied (Server is already running!)${C.reset}`);
-            } else {
-              console.log(`${C.red}Port check failed: ${err.message}${C.reset}`);
-            }
-          })
-          .once('listening', () => {
-            tester.close();
-            console.log(`${C.yellow}Port 3000 is free. Launch the server in a separate window using:${C.reset}`);
-            console.log(`  ${C.brightCyan}npm run dev${C.reset}`);
-          })
-          .listen(3000);
-      } catch {
-        console.log(`Checking completed.`);
-      }
-      
-      await pressEnterToContinue();
-    } 
-    else if (choice === '6') {
-      console.log(`\n${C.brightCyan}Thank you for using Claude Code TUI Companion! Safe hacking! 🚀${C.reset}`);
-      rl.close();
-      process.exit(0);
+      printBanner();
     }
   }
+
+  console.log(`\n${C.dim}Goodbye.${C.reset}`);
+  rl.close();
+  process.exit(0);
 }
 
 main().catch(err => {

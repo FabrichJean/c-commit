@@ -1385,7 +1385,7 @@ async function runCommitPlanner() {
 // it. Only meaningful when running as the compiled `cmt` executable (pkg sets `process.pkg`) -
 // running this from source (tsx) would otherwise try to overwrite the system node/tsx binary.
 async function runSelfUpdate(): Promise<void> {
-  const REPO_SLUG = 'FabrichJean/ccommit';
+  const REPO_SLUG = 'FabrichJean/c-commit';
 
   if (!(process as any).pkg) {
     console.log(`${C.yellow}'cmt update' only works in the compiled binary, not when running from source.${C.reset}`);

@@ -574,6 +574,14 @@ function chunkUnitsIntoCommits(units: CommitUnit[], count: number): CommitUnit[]
 // Write each bucket's real historical file content, commit it, and move on - reconstructing the
 // actual progression of the work. Every touched file is guaranteed to be left at its true current
 // content on disk when this returns, even if a commit fails partway through.
+// Parse a commit's stored timestamp into an ISO 8601 string Git will accept for
+// GIT_AUTHOR_DATE/GIT_COMMITTER_DATE, or null if it can't be parsed
+function toGitDate(timestamp: string | undefined): string | null {
+  if (!timestamp) return null;
+  const d = new Date(timestamp);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], projDir: string): { applied: number; errors: string[] } {
   let applied = 0;
   const errors: string[] = [];
@@ -605,7 +613,10 @@ function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], projDir: 
           files.push(path.relative(projDir, u.absPath));
         }
         execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
-        execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe' });
+
+        const gitDate = toGitDate(commits[i].timestamp);
+        const commitEnv = gitDate ? { ...process.env, GIT_AUTHOR_DATE: gitDate, GIT_COMMITTER_DATE: gitDate } : process.env;
+        execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe', env: commitEnv });
         applied++;
       } catch (err: any) {
         const message = (err.stderr?.toString() || err.message || '').split('\n')[0];
@@ -720,7 +731,7 @@ function generateProceduralCommits(count: number, projectName: string) {
 
   for (let i = 0; i < count; i++) {
     const stage = stages[i % stages.length];
-    const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toLocaleString();
+    const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toISOString();
     const hash = Math.random().toString(16).substring(2, 9);
 
     commits.push({
@@ -742,7 +753,7 @@ function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], project
 
   unitBuckets.forEach((bucket, i) => {
     const files = Array.from(new Set(bucket.map(u => u.file)));
-    const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toLocaleString();
+    const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toISOString();
     const hash = Math.random().toString(16).substring(2, 9);
     const label = files.length === 1 ? files[0] : `${files.length} files`;
 
@@ -762,49 +773,86 @@ function visibleLength(str: string): number {
   return str.replace(/\x1b\[[0-9;]*m/g, '').length;
 }
 
+// Truncate plain (uncolored) text to fit a visible-column budget, with an ellipsis if cut
+function truncateToWidth(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return '';
+  if (text.length <= maxWidth) return text;
+  if (maxWidth === 1) return '…';
+  return text.slice(0, maxWidth - 1) + '…';
+}
+
 // A small bracketed status badge, e.g. "[ CONNECTED ]"
 function badge(text: string, color: string): string {
   return `${color}${C.bold}[ ${text} ]${C.reset}`;
 }
 
-// Print a double-bordered banner with a status section, in the global theme (no emoji)
-function printBanner() {
-  const width = 78;
-  const innerWidth = width - 4;
-
-  const wrapLine = (text: string): string[] => {
-    const words = text.split(' ');
-    const lines: string[] = [];
-    let current = '';
-    for (const w of words) {
-      const next = current ? `${current} ${w}` : w;
-      if (next.length > innerWidth) {
-        lines.push(current);
-        current = w;
-      } else {
-        current = next;
-      }
+// Wrap plain text into lines that each fit within `maxWidth` visible columns
+function wrapToWidth(text: string, maxWidth: number): string[] {
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let current = '';
+  for (const w of words) {
+    const next = current ? `${current} ${w}` : w;
+    if (next.length > maxWidth) {
+      lines.push(current);
+      current = w;
+    } else {
+      current = next;
     }
-    if (current) lines.push(current);
-    return lines;
-  };
+  }
+  if (current) lines.push(current);
+  return lines;
+}
 
-  const titleLine = `${C.themeVivid}${C.bold}Claude Commit Planner${C.reset}`;
-  const subtitleLines = wrapLine('Generate and apply Git commit plans grounded in real Claude Code session history.')
-    .map(l => `${C.dim}${l}${C.reset}`);
+// Print a double-bordered banner with a status section, in the global theme (no emoji).
+// Sizes itself to the current terminal width, and drops the border entirely below a
+// minimum width where a box would just look broken.
+function printBanner() {
+  const termWidth = process.stdout.columns || 80;
 
   const claudeCliPath = isClaudeCliAvailable();
   const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.GEMINI_API_KEY;
 
+  const cliBadge = claudeCliPath ? badge('CONNECTED', C.green) : badge('NOT FOUND', C.yellow);
+  const credBadge = apiKey ? badge('CONFIGURED', C.green) : badge('NOT SET', C.yellow);
+  const cliDetail = claudeCliPath || 'not found on PATH';
+  const credDetail = apiKey ? '' : 'procedural fallback ready';
+
+  const MIN_BOX_WIDTH = 44;
+
+  if (termWidth < MIN_BOX_WIDTH) {
+    // Too narrow for a readable box - plain stacked lines instead
+    console.log(`${C.themeVivid}${C.bold}Claude Commit Planner${C.reset}`);
+    wrapToWidth('Generate and apply Git commit plans grounded in real Claude Code session history.', termWidth)
+      .forEach(l => console.log(`${C.dim}${l}${C.reset}`));
+    console.log();
+    console.log(`${C.dim}Claude Code CLI${C.reset} ${cliBadge}`);
+    console.log(`  ${C.dim}${truncateToWidth(cliDetail, Math.max(termWidth - 2, 4))}${C.reset}`);
+    console.log(`${C.dim}Credentials${C.reset} ${credBadge}`);
+    if (credDetail) console.log(`  ${C.dim}${truncateToWidth(credDetail, Math.max(termWidth - 2, 4))}${C.reset}`);
+    console.log();
+    return;
+  }
+
+  const width = Math.min(78, termWidth - 2);
+  const innerWidth = width - 4;
+
+  const titleLine = `${C.themeVivid}${C.bold}Claude Commit Planner${C.reset}`;
+  const subtitleLines = wrapToWidth('Generate and apply Git commit plans grounded in real Claude Code session history.', innerWidth)
+    .map(l => `${C.dim}${l}${C.reset}`);
+
   const statusRow = (label: string, statusBadge: string, detail: string) => {
     const labelPart = `${C.dim}${label.padEnd(16)}${C.reset}`;
-    const detailPart = detail ? `  ${C.dim}${detail}${C.reset}` : '';
+    const usedWidth = visibleLength(labelPart) + 1 + visibleLength(statusBadge) + (detail ? 2 : 0);
+    const detailBudget = Math.max(innerWidth - usedWidth, 0);
+    const truncatedDetail = truncateToWidth(detail, detailBudget);
+    const detailPart = truncatedDetail ? `  ${C.dim}${truncatedDetail}${C.reset}` : '';
     return `${labelPart} ${statusBadge}${detailPart}`;
   };
 
   const statusLines = [
-    statusRow('Claude Code CLI', claudeCliPath ? badge('CONNECTED', C.green) : badge('NOT FOUND', C.yellow), claudeCliPath || 'not found on PATH'),
-    statusRow('Credentials', apiKey ? badge('CONFIGURED', C.green) : badge('NOT SET', C.yellow), apiKey ? '' : 'procedural fallback ready'),
+    statusRow('Claude Code CLI', cliBadge, cliDetail),
+    statusRow('Credentials', credBadge, credDetail),
   ];
 
   const printRow = (content: string) => {
@@ -941,7 +989,9 @@ async function runCommitPlanner() {
       console.log(`  ${C.bold}Hash:   ${C.reset}${C.brightYellow}${c.hash}${C.reset}`);
       console.log(`  ${C.bold}Subject:${C.reset} ${C.white}${c.subject}${C.reset}`);
       console.log(`  ${C.bold}Body:   ${C.reset}${C.dim}${c.body}${C.reset}`);
-      console.log(`  ${C.bold}Date:   ${C.reset}${c.timestamp}`);
+      const parsedDate = new Date(c.timestamp);
+      const dateDisplay = isNaN(parsedDate.getTime()) ? c.timestamp : parsedDate.toLocaleString();
+      console.log(`  ${C.bold}Date:   ${C.reset}${dateDisplay}`);
       if (c.author) console.log(`  ${C.bold}Author: ${C.reset}${c.author}`);
       console.log();
     });

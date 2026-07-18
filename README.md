@@ -2,6 +2,8 @@
 
 Un CLI interactif qui génère (et applique, si vous le souhaitez) des plannings de commits Git réalistes — basés sur ce que Claude Code a **réellement** fait pendant vos sessions de chat, pas sur des suppositions.
 
+![Aperçu du CLI Claude Commit Planner](preview.png)
+
 Le projet contient aussi une application web compagnon indépendante (tableau de bord visuel), décrite en fin de document.
 
 ---

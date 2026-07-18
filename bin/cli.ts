@@ -129,6 +129,18 @@ const getGitAuthor = (dir: string): string => {
   return 'Claude Code <claude@anthropic.com>';
 };
 
+// The author date of HEAD, or null if the repo has no commits yet
+const getLastCommitDate = (dir: string): Date | null => {
+  try {
+    const output = execSync('git log -1 --format=%aI', { cwd: dir, stdio: 'pipe' }).toString().trim();
+    if (!output) return null;
+    const d = new Date(output);
+    return isNaN(d.getTime()) ? null : d;
+  } catch {
+    return null;
+  }
+};
+
 // If the project isn't a Git repo yet, offer to initialize one (with an optional remote) up
 // front. This must happen before any Git-based scanning (e.g. untracked file detection via
 // `git ls-files`) - otherwise those checks silently see no repository and find nothing.
@@ -373,6 +385,8 @@ function readFileContentSafe(filePath: string): string | null {
   }
 }
 
+// Reliable-enough binary detection: legitimate UTF-8 text never contains a null byte, but
+// arbitrary binary content (images, .DS_Store, lockfile-adjacent blobs, ...) read as 'utf-8'
 // Read a file's content as it was in the last commit (HEAD), tolerating new/untracked files
 function getGitHeadContent(projDir: string, relFile: string): string | null {
   try {

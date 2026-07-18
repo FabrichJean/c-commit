@@ -344,12 +344,27 @@ function getGitHeadContent(projDir: string, relFile: string): string | null {
   }
 }
 
+// Untracked files (not covered by .gitignore), relative to projDir - catches files a Claude
+// Code session created via a Bash command rather than the Edit/Write/MultiEdit/NotebookEdit
+// tools, which extractFileChanges() has no way to see.
+function getUntrackedFiles(projDir: string): string[] {
+  try {
+    return execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: projDir, stdio: 'pipe' })
+      .toString()
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 // Reconstruct the real, chronological sequence of file-content snapshots for a project using
 // Claude Code's own file-history backups (~/.claude/file-history/<sessionId>/<hash>@vN). This is
 // what lets a single file that was edited many times across a session become several real,
 // meaningful commits instead of being collapsed into one. Files with no recoverable backup
 // history fall back to a single unit using their current on-disk content.
-function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null, projDir: string, fallbackChanges: FileChange[]): CommitUnit[] {
+function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null, projDir: string, fallbackChanges: FileChange[]): { units: CommitUnit[]; untrackedCount: number } {
   const versions = new Map<string, { version: number; content: string; time: Date }[]>();
 
   if (claudeHome) {
@@ -432,8 +447,25 @@ function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null,
     units.push({ file: g.file, absPath, before, content: current, time: lastTimestamp });
   }
 
+  // Files currently untracked in Git but not represented above - most likely created via a
+  // Bash command (touch, cp, a generator script, ...) rather than one of the tracked tools.
+  const coveredFiles = new Set<string>([...versions.keys(), ...grouped.map(g => g.file)]);
+  const untrackedFiles = getUntrackedFiles(projDir).filter(f => !coveredFiles.has(f));
+  for (const relFile of untrackedFiles) {
+    const absPath = path.join(projDir, relFile);
+    const current = readFileContentSafe(absPath);
+    if (current === null) continue;
+    let mtime: Date;
+    try {
+      mtime = fs.statSync(absPath).mtime;
+    } catch {
+      mtime = new Date();
+    }
+    units.push({ file: relFile, absPath, before: '', content: current, time: mtime });
+  }
+
   units.sort((a, b) => a.time.getTime() - b.time.getTime());
-  return units;
+  return { units, untrackedCount: untrackedFiles.length };
 }
 
 // A single paired change step: replacing one old line with one new line (either side may be
@@ -928,12 +960,27 @@ async function runCommitPlanner() {
   // file-history backups where available) so a single file edited many times can become several real
   // commits, not just one. If there still aren't enough natural change-units to hit the requested
   // count, split the largest diffs line-by-line to get closer to it, up to how much real change exists.
-  let commitUnits = changes.length > 0 ? buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes) : [];
+  let commitUnits: CommitUnit[] = [];
+  let untrackedCount = 0;
+  if (sessionFilePaths.length > 0) {
+    // Run this even if extractFileChanges() found nothing - a session that only ran Bash
+    // commands (no Edit/Write/MultiEdit/NotebookEdit calls) would otherwise never be checked
+    // for untracked files it left behind.
+    const built = buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes);
+    commitUnits = built.units;
+    untrackedCount = built.untrackedCount;
+  }
   if (commitUnits.length > 0 && commitUnits.length < count) {
     commitUnits = expandUnitsToCount(commitUnits, count);
   }
   const effectiveCount = commitUnits.length > 0 ? Math.min(count, commitUnits.length) : count;
   const unitBuckets = commitUnits.length > 0 ? chunkUnitsIntoCommits(commitUnits, effectiveCount) : [];
+
+  if (untrackedCount > 0) {
+    basisLabel = changes.length > 0
+      ? `${basisLabel} (+${untrackedCount} untracked file(s) from git status)`
+      : basisLabel.replace(/^Generic \(no file changes recorded[^)]*\)$/, `Generic - ${untrackedCount} untracked file(s) from git status only`);
+  }
 
   console.log(`\n${C.dim}Generating a ${effectiveCount}-commit plan spanning ${days} day(s) for "${projName}"...${C.reset}`);
   console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
@@ -1093,7 +1140,7 @@ async function runCommitPlanner() {
 
   let readyToApply = commitUnits.length > 0 && isGitRepo(projDir);
 
-  if (changes.length === 0) {
+  if (sessionFilePaths.length === 0) {
     console.log(`${C.dim}(Apply unavailable: these are generic suggestions with no real file mapping. Pick a session-based basis to enable applying.)${C.reset}`);
   } else if (commitUnits.length === 0) {
     console.log(`${C.dim}(Apply unavailable: none of the recorded changes map to files inside this project folder.)${C.reset}`);

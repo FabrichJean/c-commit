@@ -69,7 +69,7 @@ if [ -n "$REPO_ROOT" ]; then
   BINARY_PATH="$REPO_ROOT/dist/bin/$ASSET"
 
   if [ ! -f "$BINARY_PATH" ]; then
-    echo "Compiled binary not found at $BINARY_PATH"
+    echo "[1/2] Compiled binary not found at $BINARY_PATH"
     echo "Building it now via 'npm run compile'..."
     (cd "$REPO_ROOT" && npm run compile)
   fi
@@ -79,23 +79,32 @@ if [ -n "$REPO_ROOT" ]; then
     exit 1
   fi
 
+  echo "[2/2] Installing..."
   cp "$BINARY_PATH" "$INSTALL_DIR/$BIN_NAME"
 else
-  DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-  echo "Downloading $ASSET from the latest release of $REPO..."
+  # Release assets are gzip-compressed (the embedded Node.js runtime dominates the raw binary
+  # size, and gzip shrinks that by ~60%) - decompress after downloading.
+  DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET.gz"
+  echo "[1/3] Downloading $ASSET.gz from the latest release of $REPO..."
 
   TMP_FILE="$(mktemp)"
-  trap 'rm -f "$TMP_FILE"' EXIT
+  trap 'rm -f "$TMP_FILE" "$TMP_FILE.gz"' EXIT
 
+  # --progress-bar / non-quiet wget show a live progress meter on stderr instead of downloading
+  # silently - useful feedback since the compressed asset is still ~15-20MB.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"
+    curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMP_FILE.gz"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$DOWNLOAD_URL" -O "$TMP_FILE"
+    wget --show-progress -q "$DOWNLOAD_URL" -O "$TMP_FILE.gz"
   else
     echo "Neither curl nor wget was found - please install one and retry." >&2
     exit 1
   fi
 
+  echo "[2/3] Extracting..."
+  gzip -d "$TMP_FILE.gz"
+
+  echo "[3/3] Installing..."
   mv "$TMP_FILE" "$INSTALL_DIR/$BIN_NAME"
   trap - EXIT
 fi

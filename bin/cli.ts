@@ -1364,8 +1364,58 @@ async function runSelfUpdate(): Promise<void> {
   try {
     const res = await fetch(downloadUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    bytes = Buffer.from(await res.arrayBuffer());
+  } catch (err: any) {
+    console.log(`${C.red}Download failed: ${err.message}${C.reset}`);
+    process.exit(1);
+  }
+
+  const currentPath = process.execPath;
+  const dir = path.dirname(currentPath);
+  const tempPath = path.join(dir, `.${path.basename(currentPath)}.new`);
+
+  try {
+    fs.writeFileSync(tempPath, bytes);
+    fs.chmodSync(tempPath, 0o755);
+
+    if (process.platform === 'darwin') {
+      try {
+        execFileSync('codesign', ['--force', '--sign', '-', tempPath], { stdio: 'pipe' });
+      } catch {
+        // Best effort - proceed even if codesign isn't available
+      }
+    }
+
+    if (process.platform === 'win32') {
+      // Windows won't let you overwrite a running executable in place, but it will let you
+      // rename it out of the way first.
+      const backupPath = `${currentPath}.old`;
+      try { fs.unlinkSync(backupPath); } catch {}
+      fs.renameSync(currentPath, backupPath);
+      fs.renameSync(tempPath, currentPath);
+      try { fs.unlinkSync(backupPath); } catch {}
+    } else {
+      // Same-directory rename is atomic and safe even while this exact file is currently
+      // executing - the running process keeps its old inode open until it exits.
+      fs.renameSync(tempPath, currentPath);
+    }
+  } catch (err: any) {
+    try { fs.unlinkSync(tempPath); } catch {}
+    console.log(`${C.red}Failed to replace the current binary: ${err.message}${C.reset}`);
+    console.log(`${C.dim}You may need write permission to ${dir}, or try re-running the installer instead.${C.reset}`);
+    process.exit(1);
+  }
+
+  console.log(`${C.green}Updated 'cmt'${latestTag.length > 0 ? ` to ${latestTag}` : ''} -> ${currentPath}${C.reset}`);
+}
+
 // Main logic
 async function main() {
+  if (process.argv[2] === 'update') {
+    await runSelfUpdate();
+    process.exit(0);
+  }
+
   // Load environment variables from local .env if available
   const envPath = path.join(process.cwd(), '.env');
   if (fs.existsSync(envPath)) {

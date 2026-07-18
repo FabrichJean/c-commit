@@ -1158,6 +1158,14 @@ async function runCommitPlanner() {
   let useRealDates = false;
   if (unitBuckets.length > 0) {
     console.log();
+    const dateModeIndex = await selectOption('How should commit dates be set?', [
+      'Match the real file change times (recommended)',
+      `Spread evenly across the last ${days} day(s)`
+    ]);
+    useRealDates = dateModeIndex === 0;
+  }
+
+  console.log(`\n${C.dim}Generating a ${effectiveCount}-commit plan ${useRealDates ? 'using real file change dates' : `spanning ${days} day(s)`} for "${projName}"...${C.reset}`);
   console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
   if (effectiveCount !== count) {
     console.log(`${C.yellow}Only ${commitUnits.length} real change(s) were recovered, so the plan is capped at ${effectiveCount} commit(s) instead of the requested ${count} (each commit needs a real change to apply).${C.reset}`);
@@ -1316,8 +1324,13 @@ async function runCommitPlanner() {
     method = 'Procedural (offline generator)';
   }
 
-  commits = commits.map((c: any) => ({ ...c, author: gitAuthor }));
+  // Real file-change times can predate the repo's last commit (e.g. a file touched a while ago
+  // but never committed) or land in the future (clock skew, a `touch` with a bad date). Clamp to
+  // [last commit date, now] so applied history stays chronologically sane either way.
+  const lastCommitDate = useRealDates ? getLastCommitDate(projDir) : null;
+  const now = Date.now();
 
+  commits = commits.map((c: any, i: number) => {
   printCommits(commits, intelligent, method);
 
   let readyToApply = commitUnits.length > 0 && isGitRepo(projDir);

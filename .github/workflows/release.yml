@@ -31,6 +31,19 @@ jobs:
           codesign --force --sign - dist/bin/commit-planner-macos-arm64
           codesign --force --sign - dist/bin/commit-planner-macos-x64
 
+      - name: Compress release assets
+        # The embedded Node.js runtime dominates each binary's size (~45-55MB) and gzip/zip
+        # shrink that by ~60-70% - install.sh/install.ps1 decompress after downloading, using
+        # only tools guaranteed present on each OS (gzip on macOS/Linux, Expand-Archive on
+        # Windows), so this doesn't add an install-time dependency.
+        run: |
+          cd dist/bin
+          for f in commit-planner-macos-arm64 commit-planner-macos-x64 commit-planner-linux-x64; do
+            gzip -9 -k "$f"
+          done
+          zip -9 commit-planner-win-x64.exe.zip commit-planner-win-x64.exe
+          rm commit-planner-macos-arm64 commit-planner-macos-x64 commit-planner-linux-x64 commit-planner-win-x64.exe
+
       - name: Publish release with binaries
         uses: softprops/action-gh-release@v2
         with:

@@ -1331,6 +1331,20 @@ async function runCommitPlanner() {
   const now = Date.now();
 
   commits = commits.map((c: any, i: number) => {
+    let realTime = useRealDates ? unitBuckets[i]?.[unitBuckets[i].length - 1]?.time : undefined;
+    if (realTime !== undefined) {
+      let t = realTime.getTime();
+      if (lastCommitDate !== null) t = Math.max(t, lastCommitDate.getTime());
+      t = Math.min(t, now);
+      realTime = new Date(t);
+    }
+    return {
+      ...c,
+      author: gitAuthor,
+      timestamp: realTime !== undefined ? realTime.toISOString() : c.timestamp
+    };
+  });
+
   printCommits(commits, intelligent, method);
 
   let readyToApply = commitUnits.length > 0 && isGitRepo(projDir);

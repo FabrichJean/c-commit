@@ -1,10 +1,10 @@
 # Installs the Claude Commit Planner binary as `cmt`.
 #
 # Run from a local clone, or online without cloning:
-#   irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$Repo = "FabrichJean/ccommit"
+$Repo = "FabrichJean/c-commit"
 $BinName = "cmt.exe"
 $InstallDir = if ($env:CMT_INSTALL_DIR) { $env:CMT_INSTALL_DIR } else { "$env:LOCALAPPDATA\cmt" }
 $Asset = "commit-planner-win-x64.exe"

@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import * as os from 'os';
 import * as zlib from 'zlib';
+import { fileURLToPath } from 'url';
 import { diffLines } from 'diff';
 
 // 24-bit true-color helper, for exact hex theme colors
@@ -31,6 +32,25 @@ const C = {
   theme: rgb(40, 86, 105),        // #285669 - structural (borders, secondary labels)
   themeVivid: rgb(57, 168, 213),  // vivid, more saturated/brighter version of the same hue - accents, titles
 };
+
+// __CMT_VERSION__ is substituted at build time by scripts/build-cli.mjs (esbuild `define`) with
+// package.json's version - the compiled binary embeds it, so `cmt --version` and `cmt update`'s
+// up-to-date check don't need package.json to exist at runtime. Running from source via tsx
+// skips that substitution, so fall back to reading package.json directly off disk there.
+function resolveVersion(): string {
+  if (typeof __CMT_VERSION__ === 'string') return __CMT_VERSION__;
+  try {
+    // tsx runs this file as ESM, where __dirname isn't reliably the file's real directory -
+    // import.meta.url is. Only reached in dev mode; the compiled binary always has
+    // __CMT_VERSION__ defined and never executes this branch.
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf-8'));
+    return pkg.version || '0.0.0-dev';
+  } catch {
+    return '0.0.0-dev';
+  }
+}
+const CMT_VERSION = resolveVersion();
 
 // Clear screen and reset cursor position
 const clearScreen = () => {
@@ -1486,6 +1506,12 @@ async function runSelfUpdate(): Promise<void> {
     // Non-fatal - we can still download the "latest" asset without knowing its tag name
   }
 
+  const latestVersion = latestTag.replace(/^v/, '');
+  if (latestVersion.length > 0 && latestVersion === CMT_VERSION) {
+    console.log(`${C.green}Already up to date (v${CMT_VERSION}).${C.reset}`);
+    return;
+  }
+
   const compressedAsset = `${asset}${compressedExt}`;
   const downloadUrl = `https://github.com/${REPO_SLUG}/releases/latest/download/${compressedAsset}`;
   console.log(`${C.dim}[2/4] Downloading ${compressedAsset}${latestTag.length > 0 ? ` (${latestTag})` : ''}...${C.reset}`);
@@ -1546,11 +1572,16 @@ async function runSelfUpdate(): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`${C.green}Updated 'cmt'${latestTag.length > 0 ? ` to ${latestTag}` : ''} -> ${currentPath}${C.reset}`);
+  console.log(`${C.green}Updated 'cmt' v${CMT_VERSION}${latestTag.length > 0 ? ` -> ${latestTag}` : ''} (${currentPath})${C.reset}`);
 }
 
 // Main logic
 async function main() {
+  if (process.argv[2] === '--version' || process.argv[2] === '-v' || process.argv[2] === 'version') {
+    console.log(`cmt v${CMT_VERSION}`);
+    process.exit(0);
+  }
+
   if (process.argv[2] === 'update' || process.argv[2] === '--update' || process.argv[2] === '-u' || process.argv[2] === 'upgrade' || process.argv[2] === '--upgrade') {
     await runSelfUpdate();
     process.exit(0);

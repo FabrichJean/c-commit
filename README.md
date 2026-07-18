@@ -84,28 +84,39 @@ Chacun embarque son propre runtime Node.js — aucune installation requise côt�
 
 ### Installer la commande `cmt`
 
-Pour installer l'exécutable compilé correspondant à votre machine sous la commande `cmt`, directement utilisable depuis n'importe quel dossier :
+#### En ligne, sans cloner le dépôt
 
 **macOS / Linux :**
 ```bash
-npm run install:cli
-# ou directement :
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.sh | bash
 ```
 
 **Windows (PowerShell) :**
 ```powershell
-.\install.ps1
+irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.ps1 | iex
 ```
 
-Le script détecte automatiquement votre OS/architecture, compile le binaire si besoin (`npm run compile`), puis copie l'exécutable sous le nom `cmt` (`cmt.exe` sur Windows) dans `~/.local/bin` (ou `%LOCALAPPDATA%\cmt` sur Windows). Si ce dossier n'est pas déjà dans votre `PATH`, le script vous indique la ligne à ajouter à votre profil de shell.
+Ceci télécharge directement le binaire adapté à votre OS/architecture depuis la [dernière release GitHub](https://github.com/FabrichJean/ccommit/releases/latest) — aucun clone, aucun Node.js requis.
+
+#### Depuis un clone local
+
+```bash
+npm run install:cli
+# ou directement :
+./install.sh          # macOS / Linux
+.\install.ps1          # Windows (PowerShell)
+```
+
+Dans ce cas, le script compile le binaire localement (`npm run compile`) s'il n'existe pas encore dans `dist/bin/`.
+
+#### Dans tous les cas
+
+Le script détecte automatiquement votre OS/architecture puis installe l'exécutable sous le nom `cmt` (`cmt.exe` sur Windows) dans `~/.local/bin` (ou `%LOCALAPPDATA%\cmt` sur Windows — configurable via la variable `CMT_INSTALL_DIR`). Si ce dossier n'est pas déjà dans votre `PATH`, le script vous indique la ligne à ajouter à votre profil de shell.
 
 Une fois installé :
 ```bash
 cmt
 ```
-
-Pour changer le dossier d'installation, définissez `CMT_INSTALL_DIR` avant de lancer le script.
 
 ### Application web compagnon (optionnelle, indépendante du CLI)
 
@@ -159,8 +170,13 @@ npm run dev          # lance le serveur de l'app web compagnon
 npm run build        # build de production de l'app web compagnon
 ```
 
-### Conventions
+### Publier une nouvelle release (binaires `cmt`)
 
-- Le CLI n'utilise **aucun emoji** dans sa sortie terminal — texte + couleur uniquement (thème true-color ancré sur `#285669`, badges `[ CONNECTED ]`/`[ NOT SET ]`). Merci de garder cette cohérence pour tout nouvel écran/message.
-- Toute modification touchant à l'application réelle de commits (`applyCommitUnits`, écriture de fichiers, `git commit`) doit rester derrière une confirmation explicite de l'utilisateur — jamais d'action destructive silencieuse.
-- Testez les changements avec `npm run lint` puis un passage manuel via `npm run cli` sur un dépôt jetable avant de proposer une modification touchant au flux d'application Git.
+Le workflow `.github/workflows/release.yml` compile les 4 binaires et les attache automatiquement à une release GitHub dès qu'un tag `v*` est poussé :
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+C'est ce qui alimente le script d'installation en ligne (`install.sh`/`install.ps1`), qui télécharge toujours les assets de la **dernière** release.

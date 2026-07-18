@@ -749,7 +749,19 @@ function eraseRows(rows: number) {
 // Run the local Claude Code CLI in streaming mode, printing its output live as it's generated
 function runClaudeCliStreaming(prompt: string, cwd: string, onText: (chunk: string) => void): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', ['-p', prompt, '--output-format', 'stream-json', '--include-partial-messages', '--verbose'], {
+    // This is a one-shot text task (write commit messages, return JSON) - no tools, MCP servers,
+    // or Claude Code's full default system prompt are needed. Without these flags, every call
+    // pays ~10-30k tokens of fixed agentic overhead (tool definitions, memory, skills) before a
+    // single token of actual work; with them, that drops to a few hundred.
+    const child = spawn('claude', [
+      '-p', prompt,
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      '--verbose',
+      '--tools', '',
+      '--strict-mcp-config',
+      '--system-prompt', 'You are a git commit message writer. You do not use any tools. Respond only with the exact output format requested, with no preamble, explanation, or commentary.'
+    ], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe']
     });

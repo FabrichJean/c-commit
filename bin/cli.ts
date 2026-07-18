@@ -447,7 +447,10 @@ function getUntrackedFiles(projDir: string): string[] {
 function buildCommitUnitsFromGitDiff(projDir: string): CommitUnit[] {
   let statusOutput: string;
   try {
-    statusOutput = execFileSync('git', ['status', '--porcelain'], { cwd: projDir, stdio: 'pipe' }).toString();
+    // --untracked-files=all: without it, a brand-new untracked directory collapses to a single
+    // "?? some-dir/" line instead of listing the files inside it - that line then fails to read
+    // as a file (EISDIR) and gets silently dropped, making a real new directory invisible here.
+    statusOutput = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: projDir, stdio: 'pipe' }).toString();
   } catch {
     return [];
   }

@@ -2,10 +2,10 @@
 # Installs the Claude Commit Planner binary as `cmt`.
 #
 # Run from a local clone (builds/uses dist/bin/*), or online without cloning:
-#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.sh | bash
 set -euo pipefail
 
-REPO="FabrichJean/ccommit"
+REPO="FabrichJean/c-commit"
 BIN_NAME="cmt"
 INSTALL_DIR="${CMT_INSTALL_DIR:-$HOME/.local/bin}"
 

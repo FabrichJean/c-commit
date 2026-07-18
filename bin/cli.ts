@@ -929,10 +929,21 @@ function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], project
     const label = files.length === 1 ? files[0] : `${files.length} files`;
 
     // Describe THIS bucket's own subdivision, not just "a change happened" - each bucket can be
+    // a different slice of the same file's diff (from expandUnitsToCount), so without this the
+    // body text would be identical across every commit for that file.
+    const excerpt = bucket
+      .map(u => summarizeDiffForPrompt(u.before, u.content, 6))
+      .filter(Boolean)
+      .join('\n');
+
+    const body = excerpt.length > 0
+      ? `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}:\n${excerpt}`
+      : `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}.`;
+
     commits.push({
       hash,
       subject: `chore: update ${label}`,
-      body: `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}.`,
+      body,
       timestamp,
       author: "Claude Code <claude@anthropic.com>"
     });
@@ -1144,7 +1155,9 @@ async function runCommitPlanner() {
       : basisLabel.replace(/^Generic \(no file changes recorded[^)]*\)$/, `Generic - ${untrackedCount} untracked file(s) from git status only`);
   }
 
-  console.log(`\n${C.dim}Generating a ${effectiveCount}-commit plan spanning ${days} day(s) for "${projName}"...${C.reset}`);
+  let useRealDates = false;
+  if (unitBuckets.length > 0) {
+    console.log();
   console.log(`${C.dim}Basis: ${C.reset}${C.bold}${basisLabel}${C.reset}`);
   if (effectiveCount !== count) {
     console.log(`${C.yellow}Only ${commitUnits.length} real change(s) were recovered, so the plan is capped at ${effectiveCount} commit(s) instead of the requested ${count} (each commit needs a real change to apply).${C.reset}`);

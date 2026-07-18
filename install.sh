@@ -87,26 +87,33 @@ else
   DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET.gz"
   echo "[1/3] Downloading $ASSET.gz from the latest release of $REPO..."
 
-  TMP_FILE="$(mktemp)"
-  trap 'rm -f "$TMP_FILE" "$TMP_FILE.gz"' EXIT
+  # A plain `mktemp` file already exists on disk the moment it's created - `gzip -d` refuses to
+  # decompress onto a path that already exists (non-interactive gzip treats that as "skip", non-
+  # zero exit, which then aborted the whole script under `set -e` before the binary was ever
+  # installed). Using a fresh temp directory instead means the decompressed output path has never
+  # existed, so there's nothing for gzip to collide with.
+  TMP_DIR="$(mktemp -d)"
+  TMP_GZ="$TMP_DIR/$ASSET.gz"
+  trap 'rm -rf "$TMP_DIR"' EXIT
 
   # --progress-bar / non-quiet wget show a live progress meter on stderr instead of downloading
   # silently - useful feedback since the compressed asset is still ~15-20MB.
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMP_FILE.gz"
+    curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMP_GZ"
   elif command -v wget >/dev/null 2>&1; then
-    wget --show-progress -q "$DOWNLOAD_URL" -O "$TMP_FILE.gz"
+    wget --show-progress -q "$DOWNLOAD_URL" -O "$TMP_GZ"
   else
     echo "Neither curl nor wget was found - please install one and retry." >&2
     exit 1
   fi
 
   echo "[2/3] Extracting..."
-  gzip -d "$TMP_FILE.gz"
+  gzip -d "$TMP_GZ"
 
   echo "[3/3] Installing..."
-  mv "$TMP_FILE" "$INSTALL_DIR/$BIN_NAME"
+  mv "$TMP_DIR/$ASSET" "$INSTALL_DIR/$BIN_NAME"
   trap - EXIT
+  rm -rf "$TMP_DIR"
 fi
 
 chmod +x "$INSTALL_DIR/$BIN_NAME"

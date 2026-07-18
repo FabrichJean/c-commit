@@ -113,9 +113,27 @@ Dans ce cas, le script compile le binaire localement (`npm run compile`) s'il n'
 
 Le script détecte automatiquement votre OS/architecture puis installe l'exécutable sous le nom `cmt` (`cmt.exe` sur Windows) dans `~/.local/bin` (ou `%LOCALAPPDATA%\cmt` sur Windows — configurable via la variable `CMT_INSTALL_DIR`). Si ce dossier n'est pas déjà dans votre `PATH`, le script vous indique la ligne à ajouter à votre profil de shell.
 
+Si `cmt` est déjà installé, le script le détecte et vous demande confirmation avant d'écraser l'installation existante (avec la commande de désinstallation en rappel, au cas où).
+
 Une fois installé :
 ```bash
 cmt
+```
+
+### Désinstaller
+
+**macOS / Linux :**
+```bash
+npm run uninstall:cli
+# ou en ligne, sans clone :
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/ccommit/main/uninstall.sh | bash
+```
+
+**Windows (PowerShell) :**
+```powershell
+.\uninstall.ps1
+# ou en ligne :
+irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/uninstall.ps1 | iex
 ```
 
 ### Application web compagnon (optionnelle, indépendante du CLI)
@@ -144,6 +162,9 @@ bin/cli.ts        → le CLI (Claude Commit Planner), point d'entrée principal 
 bin/diff.d.ts      → déclaration de types locale pour le paquet `diff` (qui n'en fournit pas)
 install.sh          → installe le binaire compilé sous la commande `cmt` (macOS/Linux)
 install.ps1          → équivalent Windows (PowerShell)
+uninstall.sh         → retire `cmt` (macOS/Linux)
+uninstall.ps1        → équivalent Windows (PowerShell)
+.github/workflows/release.yml → compile et publie les 4 binaires sur chaque tag `v*`
 server.ts          → serveur Express de l'application web compagnon
 src/               → application web compagnon (React + Vite)
 ```

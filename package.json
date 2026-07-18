@@ -11,6 +11,7 @@
     "build:cli": "esbuild bin/cli.ts --bundle --platform=node --format=cjs --outfile=dist/cli.cjs",
     "compile": "npm run build:cli && pkg dist/cli.cjs --targets node20-macos-arm64,node20-macos-x64,node20-linux-x64,node20-win-x64 --output dist/bin/commit-planner",
     "install:cli": "./install.sh",
+    "uninstall:cli": "./uninstall.sh",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

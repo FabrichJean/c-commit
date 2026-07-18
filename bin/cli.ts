@@ -45,6 +45,67 @@ const question = (query: string): Promise<string> => {
   return new Promise((resolve) => rl.question(query, resolve));
 };
 
+// Arrow-key navigable option picker: up/down to move, Enter to confirm, Ctrl+C to exit.
+// Falls back to returning the first option immediately when stdin isn't a real TTY.
+function selectOption(promptText: string, options: string[]): Promise<number> {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      console.log(`${C.bold}${promptText}${C.reset} ${C.themeVivid}${options[0]}${C.reset}`);
+      resolve(0);
+      return;
+    }
+
+    let selected = 0;
+
+    const renderOptions = () => {
+      options.forEach((opt, i) => {
+        const isSelected = i === selected;
+        const marker = isSelected ? `${C.themeVivid}${C.bold}>${C.reset}` : ' ';
+        const label = isSelected ? `${C.themeVivid}${opt}${C.reset}` : `${C.dim}${opt}${C.reset}`;
+        console.log(` ${marker} ${label}`);
+      });
+    };
+
+    console.log(`${C.bold}${promptText}${C.reset} ${C.dim}(use arrow keys, Enter to confirm)${C.reset}`);
+    renderOptions();
+
+    const onKeypress = (_str: string, key: any) => {
+      if (!key) return;
+      if (key.name === 'up') {
+        selected = (selected - 1 + options.length) % options.length;
+        eraseRows(options.length);
+        renderOptions();
+      } else if (key.name === 'down') {
+        selected = (selected + 1) % options.length;
+        eraseRows(options.length);
+        renderOptions();
+      } else if (key.name === 'return') {
+        eraseRows(options.length + 1);
+        console.log(`${C.bold}${promptText}${C.reset} ${C.themeVivid}${options[selected]}${C.reset}`);
+        cleanup();
+        resolve(selected);
+      } else if (key.ctrl && key.name === 'c') {
+        cleanup();
+        console.log(`\n${C.dim}Goodbye.${C.reset}`);
+        process.exit(0);
+      }
+    };
+
+    const cleanup = () => {
+      process.stdin.removeListener('keypress', onKeypress);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      rl.resume();
+    };
+
+    rl.pause();
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.on('keypress', onKeypress);
+    process.stdin.resume();
+  });
+}
+
 // Check if Git is initialized in the given directory
 const isGitRepo = (dir: string): boolean => {
   try {
@@ -696,11 +757,20 @@ function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], project
   return commits;
 }
 
-// Print a plain bordered banner (no emoji, single accent color)
+// Length of a string as it will actually appear on screen, ignoring ANSI escape codes
+function visibleLength(str: string): number {
+  return str.replace(/\x1b\[[0-9;]*m/g, '').length;
+}
+
+// A small bracketed status badge, e.g. "[ CONNECTED ]"
+function badge(text: string, color: string): string {
+  return `${color}${C.bold}[ ${text} ]${C.reset}`;
+}
+
+// Print a double-bordered banner with a status section, in the global theme (no emoji)
 function printBanner() {
-  const width = 74;
-  const title = 'Claude Commit Planner';
-  const subtitle = 'Generate and apply Git commit plans grounded in real Claude Code session history.';
+  const width = 78;
+  const innerWidth = width - 4;
 
   const wrapLine = (text: string): string[] => {
     const words = text.split(' ');
@@ -708,7 +778,7 @@ function printBanner() {
     let current = '';
     for (const w of words) {
       const next = current ? `${current} ${w}` : w;
-      if (next.length > width - 4) {
+      if (next.length > innerWidth) {
         lines.push(current);
         current = w;
       } else {
@@ -719,22 +789,34 @@ function printBanner() {
     return lines;
   };
 
-  const bodyLines = [title, '', ...wrapLine(subtitle)];
-
-  console.log(`${C.theme}┌${'─'.repeat(width - 2)}┐${C.reset}`);
-  bodyLines.forEach((line, idx) => {
-    const styled = idx === 0 ? `${C.themeVivid}${C.bold}${line}${C.reset}` : `${C.dim}${line}${C.reset}`;
-    const padding = ' '.repeat(Math.max(width - 4 - line.length, 0));
-    console.log(`${C.theme}│${C.reset} ${styled}${padding} ${C.theme}│${C.reset}`);
-  });
-  console.log(`${C.theme}└${'─'.repeat(width - 2)}┘${C.reset}`);
-  console.log();
+  const titleLine = `${C.themeVivid}${C.bold}Claude Commit Planner${C.reset}`;
+  const subtitleLines = wrapLine('Generate and apply Git commit plans grounded in real Claude Code session history.')
+    .map(l => `${C.dim}${l}${C.reset}`);
 
   const claudeCliPath = isClaudeCliAvailable();
-  console.log(`  ${C.dim}Claude Code CLI${C.reset}   ${claudeCliPath ? `${C.green}Connected${C.reset} ${C.dim}(${claudeCliPath})${C.reset}` : `${C.yellow}Not found on PATH${C.reset}`}`);
-
   const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.GEMINI_API_KEY;
-  console.log(`  ${C.dim}Credentials${C.reset}       ${apiKey ? `${C.green}Configured${C.reset}` : `${C.yellow}Not set${C.reset} ${C.dim}(procedural fallback will be used if needed)${C.reset}`}`);
+
+  const statusRow = (label: string, statusBadge: string, detail: string) => {
+    const labelPart = `${C.dim}${label.padEnd(16)}${C.reset}`;
+    const detailPart = detail ? `  ${C.dim}${detail}${C.reset}` : '';
+    return `${labelPart} ${statusBadge}${detailPart}`;
+  };
+
+  const statusLines = [
+    statusRow('Claude Code CLI', claudeCliPath ? badge('CONNECTED', C.green) : badge('NOT FOUND', C.yellow), claudeCliPath || 'not found on PATH'),
+    statusRow('Credentials', apiKey ? badge('CONFIGURED', C.green) : badge('NOT SET', C.yellow), apiKey ? '' : 'procedural fallback ready'),
+  ];
+
+  const printRow = (content: string) => {
+    const padding = ' '.repeat(Math.max(innerWidth - visibleLength(content), 0));
+    console.log(`${C.theme}║${C.reset} ${content}${padding} ${C.theme}║${C.reset}`);
+  };
+
+  console.log(`${C.theme}╔${'═'.repeat(width - 2)}╗${C.reset}`);
+  [titleLine, '', ...subtitleLines].forEach(printRow);
+  console.log(`${C.theme}╠${'═'.repeat(width - 2)}╣${C.reset}`);
+  statusLines.forEach(printRow);
+  console.log(`${C.theme}╚${'═'.repeat(width - 2)}╝${C.reset}`);
   console.log();
 }
 
@@ -757,12 +839,13 @@ async function runCommitPlanner() {
   const rawDays = await question(`Over how many days of timeline history? (default: 3): `);
   const days = parseInt(rawDays) || 3;
 
-  console.log(`\n${C.bold}Base suggestions on real Claude Code modifications?${C.reset}`);
-  console.log(`  1. A specific chat session`);
-  console.log(`  2. All sessions for this project (general)`);
-  console.log(`  3. No - generate generic suggestions`);
-  const rawBasis = await question(`Choice (default: 3): `);
-  const basisChoice = rawBasis.trim() || '3';
+  console.log();
+  const basisIndex = await selectOption('Base suggestions on real Claude Code modifications?', [
+    'A specific chat session',
+    'All sessions for this project (general)',
+    'No - generate generic suggestions'
+  ]);
+  const basisChoice = String(basisIndex + 1);
 
   let changes: FileChange[] = [];
   let sessionFilePaths: string[] = [];
@@ -781,13 +864,10 @@ async function runCommitPlanner() {
         ? `General - ${sessions.summaries.length} session(s), ${changes.length} file change(s)`
         : 'Generic (no file changes recorded across sessions)';
     } else {
-      console.log(`\n${C.bold}Available sessions:${C.reset}`);
-      sessions.summaries.forEach((s, idx) => {
-        console.log(`  ${C.bold}${idx + 1}.${C.reset} ${s.title || '(untitled session)'} ${C.dim}- ${s.mtime.toLocaleString()} (${s.messageCount} messages)${C.reset}`);
-      });
-      const rawPick = await question(`\nSession number (${C.dim}default: most recent${C.reset}): `);
-      const pick = parseInt(rawPick.trim());
-      const chosen = (!isNaN(pick) && pick >= 1 && pick <= sessions.summaries.length) ? sessions.summaries[pick - 1] : sessions.summaries[0];
+      console.log();
+      const sessionLabels = sessions.summaries.map(s => `${s.title || '(untitled session)'} - ${s.mtime.toLocaleString()} (${s.messageCount} messages)`);
+      const pickIndex = await selectOption('Available sessions:', sessionLabels);
+      const chosen = sessions.summaries[pickIndex];
       sessionFilePaths = [chosen.filePath];
       changes = extractFileChanges(sessionFilePaths);
       basisLabel = changes.length > 0

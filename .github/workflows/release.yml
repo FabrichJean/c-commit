@@ -23,6 +23,18 @@ jobs:
 
       - run: npm ci
 
+      - name: Verify tag matches package.json version
+        # package.json is the version source of truth (bumped by hand before tagging) - the
+        # build embeds it into the binary (`cmt --version`, `cmt update`'s up-to-date check), so
+        # a tag/package.json mismatch would ship a binary that misreports its own version.
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION - bump package.json first." >&2
+            exit 1
+          fi
+
       - name: Compile cross-platform binaries
         run: npm run compile
 

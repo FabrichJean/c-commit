@@ -129,6 +129,44 @@ const getGitAuthor = (dir: string): string => {
   return 'Claude Code <claude@anthropic.com>';
 };
 
+// If the project isn't a Git repo yet, offer to initialize one (with an optional remote) up
+// front. This must happen before any Git-based scanning (e.g. untracked file detection via
+// `git ls-files`) - otherwise those checks silently see no repository and find nothing.
+const offerGitInitIfNeeded = async (projDir: string, gitAuthor: string): Promise<void> => {
+  if (isGitRepo(projDir)) return;
+
+  console.log(`${C.yellow}${projDir} is not a Git repository yet.${C.reset}`);
+  const rawInit = await question(`Initialize a Git repository here now? (y/N): `);
+  if (rawInit.trim().toLowerCase() !== 'y') {
+    console.log(`${C.dim}Skipped - no Git repository was initialized.${C.reset}`);
+    return;
+  }
+
+  try {
+    execFileSync('git', ['init'], { cwd: projDir, stdio: 'pipe' });
+
+    const authorMatch = gitAuthor.match(/^(.*?)\s*<([^>]+)>$/);
+    if (authorMatch) {
+      execFileSync('git', ['config', 'user.name', authorMatch[1]], { cwd: projDir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.email', authorMatch[2]], { cwd: projDir, stdio: 'pipe' });
+    }
+
+    console.log(`${C.green}Initialized empty Git repository in ${projDir}${C.reset}`);
+
+    const rawRemote = await question(`Add a Git remote URL now? (${C.dim}optional, press Enter to skip${C.reset}): `);
+    if (rawRemote.trim()) {
+      try {
+        execFileSync('git', ['remote', 'add', 'origin', rawRemote.trim()], { cwd: projDir, stdio: 'pipe' });
+        console.log(`${C.green}Remote 'origin' set to ${rawRemote.trim()}${C.reset}`);
+      } catch (err: any) {
+        console.log(`${C.red}Failed to add remote: ${err.message}${C.reset}`);
+      }
+    }
+  } catch (err: any) {
+    console.log(`${C.red}Failed to initialize Git repository: ${err.message}${C.reset}`);
+  }
+};
+
 // Expand a leading ~ to the user's home directory and resolve to an absolute path
 const resolvePath = (input: string): string => {
   let p = input.trim();
@@ -956,6 +994,13 @@ async function runCommitPlanner() {
     }
   }
 
+  // Get the repo into a real Git state now, before any Git-based scanning below (the untracked
+  // file catch-up in buildCommitUnits needs a real repository to query, or it silently finds
+  // nothing - see offerGitInitIfNeeded's comment).
+  if (sessionFilePaths.length > 0) {
+    await offerGitInitIfNeeded(projDir, gitAuthor);
+  }
+
   // Reconstruct the real, chronological progression of every touched file (using Claude Code's own
   // file-history backups where available) so a single file edited many times can become several real
   // commits, not just one. If there still aren't enough natural change-units to hit the requested
@@ -1145,37 +1190,7 @@ async function runCommitPlanner() {
   } else if (commitUnits.length === 0) {
     console.log(`${C.dim}(Apply unavailable: none of the recorded changes map to files inside this project folder.)${C.reset}`);
   } else if (!isGitRepo(projDir)) {
-    console.log(`${C.yellow}${projDir} is not a Git repository yet.${C.reset}`);
-    const rawInit = await question(`Initialize a Git repository here now? (y/N): `);
-    if (rawInit.trim().toLowerCase() === 'y') {
-      try {
-        execFileSync('git', ['init'], { cwd: projDir, stdio: 'pipe' });
-
-        const authorMatch = gitAuthor.match(/^(.*?)\s*<([^>]+)>$/);
-        if (authorMatch) {
-          execFileSync('git', ['config', 'user.name', authorMatch[1]], { cwd: projDir, stdio: 'pipe' });
-          execFileSync('git', ['config', 'user.email', authorMatch[2]], { cwd: projDir, stdio: 'pipe' });
-        }
-
-        console.log(`${C.green}Initialized empty Git repository in ${projDir}${C.reset}`);
-
-        const rawRemote = await question(`Add a Git remote URL now? (${C.dim}optional, press Enter to skip${C.reset}): `);
-        if (rawRemote.trim()) {
-          try {
-            execFileSync('git', ['remote', 'add', 'origin', rawRemote.trim()], { cwd: projDir, stdio: 'pipe' });
-            console.log(`${C.green}Remote 'origin' set to ${rawRemote.trim()}${C.reset}`);
-          } catch (err: any) {
-            console.log(`${C.red}Failed to add remote: ${err.message}${C.reset}`);
-          }
-        }
-
-        readyToApply = true;
-      } catch (err: any) {
-        console.log(`${C.red}Failed to initialize Git repository: ${err.message}${C.reset}`);
-      }
-    } else {
-      console.log(`${C.dim}Skipped - no Git repository was initialized.${C.reset}`);
-    }
+    console.log(`${C.dim}(Apply unavailable: ${projDir} is still not a Git repository - it was not initialized earlier.)${C.reset}`);
   }
 
   if (readyToApply) {

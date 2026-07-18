@@ -122,6 +122,10 @@ Une fois installé :
 cmt
 ```
 
+### Mettre à jour
+
+```bash
+cmt update
 ### Désinstaller
 
 **macOS / Linux :**

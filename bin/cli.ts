@@ -5,6 +5,9 @@ import * as readline from 'readline';
 import * as os from 'os';
 import { diffLines } from 'diff';
 
+// 24-bit true-color helper, for exact hex theme colors
+const rgb = (r: number, g: number, b: number) => `\x1b[38;2;${r};${g};${b}m`;
+
 // ANSI escape codes for styling
 const C = {
   reset: '\x1b[0m',
@@ -16,14 +19,16 @@ const C = {
   red: '\x1b[31m',
   green: '\x1b[32m',
   yellow: '\x1b[33m',
-  cyan: '\x1b[36m',
   white: '\x1b[37m',
 
   brightRed: '\x1b[91m',
   brightGreen: '\x1b[92m',
   brightYellow: '\x1b[93m',
-  brightCyan: '\x1b[96m',
   brightWhite: '\x1b[97m',
+
+  // Global theme, anchored on #285669
+  theme: rgb(40, 86, 105),        // #285669 - structural (borders, secondary labels)
+  themeVivid: rgb(57, 168, 213),  // vivid, more saturated/brighter version of the same hue - accents, titles
 };
 
 // Clear screen and reset cursor position
@@ -487,16 +492,21 @@ function expandUnitsToCount(units: CommitUnit[], targetCount: number): CommitUni
 }
 
 // Distribute chronologically-ordered commit units into at most `count` contiguous buckets,
-// preserving order both within and across buckets.
+// preserving order both within and across buckets. Every bucket is guaranteed at least one
+// unit: the first `remainder` buckets get one extra item so nothing is ever left empty.
 function chunkUnitsIntoCommits(units: CommitUnit[], count: number): CommitUnit[][] {
   if (units.length === 0 || count <= 0) return [];
   const bucketCount = Math.min(count, units.length);
-  const perBucket = Math.ceil(units.length / bucketCount);
-  const buckets: CommitUnit[][] = Array.from({ length: bucketCount }, () => []);
-  units.forEach((u, i) => {
-    const idx = Math.min(Math.floor(i / perBucket), bucketCount - 1);
-    buckets[idx].push(u);
-  });
+  const base = Math.floor(units.length / bucketCount);
+  const remainder = units.length % bucketCount;
+
+  const buckets: CommitUnit[][] = [];
+  let idx = 0;
+  for (let b = 0; b < bucketCount; b++) {
+    const size = base + (b < remainder ? 1 : 0);
+    buckets.push(units.slice(idx, idx + size));
+    idx += size;
+  }
   return buckets;
 }
 
@@ -711,13 +721,13 @@ function printBanner() {
 
   const bodyLines = [title, '', ...wrapLine(subtitle)];
 
-  console.log(`${C.cyan}┌${'─'.repeat(width - 2)}┐${C.reset}`);
+  console.log(`${C.theme}┌${'─'.repeat(width - 2)}┐${C.reset}`);
   bodyLines.forEach((line, idx) => {
-    const styled = idx === 0 ? `${C.bold}${line}${C.reset}` : `${C.dim}${line}${C.reset}`;
+    const styled = idx === 0 ? `${C.themeVivid}${C.bold}${line}${C.reset}` : `${C.dim}${line}${C.reset}`;
     const padding = ' '.repeat(Math.max(width - 4 - line.length, 0));
-    console.log(`${C.cyan}│${C.reset} ${styled}${padding} ${C.cyan}│${C.reset}`);
+    console.log(`${C.theme}│${C.reset} ${styled}${padding} ${C.theme}│${C.reset}`);
   });
-  console.log(`${C.cyan}└${'─'.repeat(width - 2)}┘${C.reset}`);
+  console.log(`${C.theme}└${'─'.repeat(width - 2)}┘${C.reset}`);
   console.log();
 
   const claudeCliPath = isClaudeCliAvailable();
@@ -847,7 +857,7 @@ async function runCommitPlanner() {
   const printCommits = (commits: any[], intelligent: boolean, method: string) => {
     console.log(`\n${C.green}Generated ${commits.length} ${intelligent ? 'intelligent' : 'chronological'} commits ${C.dim}(method: ${C.reset}${C.bold}${method}${C.reset}${C.dim})${C.reset}\n`);
     commits.forEach((c: any, idx: number) => {
-      console.log(`${C.brightCyan}${C.bold}Commit ${idx + 1}${C.reset}`);
+      console.log(`${C.themeVivid}${C.bold}Commit ${idx + 1}${C.reset}`);
       console.log(`  ${C.bold}Hash:   ${C.reset}${C.brightYellow}${c.hash}${C.reset}`);
       console.log(`  ${C.bold}Subject:${C.reset} ${C.white}${c.subject}${C.reset}`);
       console.log(`  ${C.bold}Body:   ${C.reset}${C.dim}${c.body}${C.reset}`);

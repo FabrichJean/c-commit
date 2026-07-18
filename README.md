@@ -90,15 +90,15 @@ Chacun embarque son propre runtime Node.js — aucune installation requise côt�
 
 **macOS / Linux :**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.sh | bash
 ```
 
 **Windows (PowerShell) :**
 ```powershell
-irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.ps1 | iex
 ```
 
-Ceci télécharge directement le binaire adapté à votre OS/architecture depuis la [dernière release GitHub](https://github.com/FabrichJean/ccommit/releases/latest) — aucun clone, aucun Node.js requis.
+Ceci télécharge directement le binaire adapté à votre OS/architecture depuis la [dernière release GitHub](https://github.com/FabrichJean/c-commit/releases/latest) — aucun clone, aucun Node.js requis.
 
 #### Depuis un clone local
 
@@ -136,14 +136,14 @@ Télécharge le binaire correspondant à votre plateforme depuis la dernière re
 ```bash
 npm run uninstall:cli
 # ou en ligne, sans clone :
-curl -fsSL https://raw.githubusercontent.com/FabrichJean/ccommit/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.sh | bash
 ```
 
 **Windows (PowerShell) :**
 ```powershell
 .\uninstall.ps1
 # ou en ligne :
-irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.ps1 | iex
 ```
 
 ### Application web compagnon (optionnelle, indépendante du CLI)

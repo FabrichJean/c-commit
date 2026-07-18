@@ -1,7 +1,7 @@
 # Removes the `cmt` binary installed by install.ps1.
 #
 # Run from a local clone, or online without cloning:
-#   irm https://raw.githubusercontent.com/FabrichJean/ccommit/main/uninstall.ps1 | iex
+#   irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.ps1 | iex
 $ErrorActionPreference = "Stop"
 
 $BinName = "cmt.exe"

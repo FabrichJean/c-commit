@@ -82,7 +82,9 @@ commit-planner-macos-x64
 commit-planner-win-x64.exe
 ```
 
-Chacun embarque son propre runtime Node.js — aucune installation requise côté utilisateur final. `git` (et `claude`, si vous voulez l'IA locale) doivent toujours être présents sur la machine qui exécute le binaire.
+Chacun embarque son propre runtime Node.js (~45-55 Mo non compressé) — aucune installation requise côté utilisateur final. `git` (et `claude`, si vous voulez l'IA locale) doivent toujours être présents sur la machine qui exécute le binaire.
+
+Les assets publiés sur les releases GitHub sont compressés (`.gz` pour macOS/Linux, `.zip` pour Windows) — environ **60-65% plus légers à télécharger** que les binaires bruts. `install.sh`/`install.ps1` les décompressent automatiquement avec des outils déjà présents sur chaque OS (`gzip`, `Expand-Archive`) — aucune dépendance supplémentaire à installer.
 
 ### Installer la commande `cmt`
 
@@ -127,6 +129,12 @@ cmt
 ```bash
 cmt update
 ```
+ou
+
+```bash
+cmt upgrade
+```
+ou
 
 Télécharge le binaire correspondant à votre plateforme depuis la dernière release GitHub et remplace l'exécutable en cours d'utilisation (re-signature ad-hoc automatique sur macOS). Ne fonctionne que dans le binaire compilé — pas via `npm run cli` / `tsx`, où `git pull` fait office de mise à jour.
 
@@ -203,7 +211,7 @@ npm run build        # build de production de l'app web compagnon
 
 ### Publier une nouvelle release (binaires `cmt`)
 
-Le workflow `.github/workflows/release.yml` compile les 4 binaires et les attache automatiquement à une release GitHub dès qu'un tag `v*` est poussé :
+Le workflow `.github/workflows/release.yml` compile les 4 binaires, les compresse (`.gz`/`.zip`) et les attache automatiquement à une release GitHub dès qu'un tag `v*` est poussé :
 
 ```bash
 git tag v0.1.0

@@ -128,15 +128,10 @@ cmt
 
 ```bash
 cmt update
+# ou : cmt upgrade
 ```
-ou
 
-```bash
-cmt upgrade
-```
-ou
-
-Télécharge le binaire correspondant à votre plateforme depuis la dernière release GitHub et remplace l'exécutable en cours d'utilisation (re-signature ad-hoc automatique sur macOS). Ne fonctionne que dans le binaire compilé — pas via `npm run cli` / `tsx`, où `git pull` fait office de mise à jour.
+Vérifie la dernière release GitHub par rapport à votre version actuelle (`cmt --version`) — si elle est déjà à jour, ne télécharge rien. Sinon, télécharge le binaire correspondant à votre plateforme (avec barre de progression), l'installe à la place de l'exécutable en cours d'utilisation (re-signature ad-hoc automatique sur macOS). Ne fonctionne que dans le binaire compilé — pas via `npm run cli` / `tsx`, où `git pull` fait office de mise à jour.
 
 ### Désinstaller
 
@@ -178,6 +173,9 @@ npm run start
 ```
 bin/cli.ts        → le CLI (Claude Commit Planner), point d'entrée principal du projet
 bin/diff.d.ts      → déclaration de types locale pour le paquet `diff` (qui n'en fournit pas)
+bin/globals.d.ts    → déclaration de `__CMT_VERSION__` (injecté au build par scripts/build-cli.mjs)
+scripts/build-cli.mjs → bundle bin/cli.ts avec esbuild, en y injectant la version de package.json
+scripts/release.mjs   → bump package.json + commit + tag, en une seule action atomique (npm run release)
 install.sh          → installe le binaire compilé sous la commande `cmt` (macOS/Linux)
 install.ps1          → équivalent Windows (PowerShell)
 uninstall.sh         → retire `cmt` (macOS/Linux)
@@ -211,11 +209,19 @@ npm run build        # build de production de l'app web compagnon
 
 ### Publier une nouvelle release (binaires `cmt`)
 
-Le workflow `.github/workflows/release.yml` compile les 4 binaires, les compresse (`.gz`/`.zip`) et les attache automatiquement à une release GitHub dès qu'un tag `v*` est poussé :
+`package.json` est la source de vérité pour la version — elle est embarquée dans le binaire au build (`__CMT_VERSION__`, injecté par `scripts/build-cli.mjs`) et exposée via `cmt --version`. Un tag Git créé séparément d'un bump de `package.json` peut diverger (le tag pointe sur un commit figé, il ne "suit" pas les changements ultérieurs) — `npm run release` fait donc les deux ensemble, en une seule action atomique :
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+npm run release -- 0.1.6
+# ou un incrément semver : npm run release -- patch / minor / major
 ```
 
-C'est ce qui alimente le script d'installation en ligne (`install.sh`/`install.ps1`), qui télécharge toujours les assets de la **dernière** release.
+Ceci bump `package.json` (et `package-lock.json`), commit, et crée le tag `vX.Y.Z` correspondant localement — sans rien pousser. Le script affiche la commande de push à la fin ; l'exécuter déclenche réellement la release :
+
+```bash
+git push origin main v0.1.6
+```
+
+Le workflow `.github/workflows/release.yml` vérifie d'abord que le tag poussé correspond bien à `package.json` (échoue sinon — filet de sécurité si jamais vous avez tagué à la main), puis compile les 4 binaires, les compresse (`.gz`/`.zip`) et les attache automatiquement à une release GitHub.
+
+C'est ce qui alimente le script d'installation en ligne (`install.sh`/`install.ps1`) et `cmt update`, qui téléchargent toujours les assets de la **dernière** release — et `cmt update` compare désormais cette version à `cmt --version` pour savoir si une mise à jour est nécessaire.

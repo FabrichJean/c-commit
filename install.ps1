@@ -3,6 +3,9 @@
 # Run from a local clone, or online without cloning:
 #   irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"
+# Piped execution (irm | iex) can inherit $ProgressPreference = 'SilentlyContinue', which hides
+# Invoke-WebRequest's built-in download progress bar - force it on so downloads aren't silent.
+$ProgressPreference = "Continue"
 
 $Repo = "FabrichJean/c-commit"
 $BinName = "cmt.exe"
@@ -40,7 +43,7 @@ if ($RepoRoot) {
     $BinaryPath = Join-Path $RepoRoot "dist\bin\$Asset"
 
     if (-not (Test-Path $BinaryPath)) {
-        Write-Host "Compiled binary not found at $BinaryPath"
+        Write-Host "[1/2] Compiled binary not found at $BinaryPath"
         Write-Host "Building it now via 'npm run compile'..."
         Push-Location $RepoRoot
         npm run compile
@@ -52,11 +55,29 @@ if ($RepoRoot) {
         exit 1
     }
 
+    Write-Host "[2/2] Installing..."
     Copy-Item -Force $BinaryPath (Join-Path $InstallDir $BinName)
 } else {
-    $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$Asset"
-    Write-Host "Downloading $Asset from the latest release of $Repo..."
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile (Join-Path $InstallDir $BinName)
+    # Release assets are zip-compressed (the embedded Node.js runtime dominates the raw binary
+    # size, and zip shrinks that noticeably) - extract after downloading.
+    $ZipAsset = "$Asset.zip"
+    $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$ZipAsset"
+    Write-Host "[1/3] Downloading $ZipAsset from the latest release of $Repo..."
+
+    $TempZip = Join-Path ([System.IO.Path]::GetTempPath()) "$([guid]::NewGuid()).zip"
+    $TempExtractDir = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid())
+    try {
+        # -Verbose:$false keeps Invoke-WebRequest's own status lines out of the way while still
+        # showing its native progress bar (percent, speed, ETA) since $ProgressPreference is on.
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip -Verbose:$false
+        Write-Host "[2/3] Extracting..."
+        Expand-Archive -Path $TempZip -DestinationPath $TempExtractDir -Force
+        Write-Host "[3/3] Installing..."
+        Copy-Item -Force (Join-Path $TempExtractDir $Asset) (Join-Path $InstallDir $BinName)
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $TempZip
+        Remove-Item -Force -Recurse -ErrorAction SilentlyContinue $TempExtractDir
+    }
 }
 
 Write-Host "Installed '$BinName' -> $InstallDir\$BinName"

@@ -126,6 +126,10 @@ cmt
 
 ```bash
 cmt update
+```
+
+Télécharge le binaire correspondant à votre plateforme depuis la dernière release GitHub et remplace l'exécutable en cours d'utilisation (re-signature ad-hoc automatique sur macOS). Ne fonctionne que dans le binaire compilé — pas via `npm run cli` / `tsx`, où `git pull` fait office de mise à jour.
+
 ### Désinstaller
 
 **macOS / Linux :**

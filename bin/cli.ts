@@ -387,10 +387,18 @@ function readFileContentSafe(filePath: string): string | null {
 
 // Reliable-enough binary detection: legitimate UTF-8 text never contains a null byte, but
 // arbitrary binary content (images, .DS_Store, lockfile-adjacent blobs, ...) read as 'utf-8'
+// usually will. Binary files can't be turned into a sensible diff/commit message anyway, and a
+// null byte in a spawn() argument crashes the process outright ("must be a string without null
+// bytes"), so these are skipped rather than turned into a commit unit.
+function isBinaryContent(content: string): boolean {
+  return content.includes('\0');
+}
+
 // Read a file's content as it was in the last commit (HEAD), tolerating new/untracked files
 function getGitHeadContent(projDir: string, relFile: string): string | null {
   try {
-    return execFileSync('git', ['show', `HEAD:${relFile.split(path.sep).join('/')}`], { cwd: projDir, stdio: 'pipe' }).toString();
+    const content = execFileSync('git', ['show', `HEAD:${relFile.split(path.sep).join('/')}`], { cwd: projDir, stdio: 'pipe' }).toString();
+    return isBinaryContent(content) ? null : content;
   } catch {
     return null;
   }
@@ -436,7 +444,7 @@ function buildCommitUnitsFromGitDiff(projDir: string): CommitUnit[] {
 
     const absPath = path.join(projDir, relFile);
     const current = readFileContentSafe(absPath);
-    if (current === null) continue;
+    if (current === null || isBinaryContent(current)) continue;
 
     const isUntracked = statusCode.includes('?');
     const before = isUntracked ? '' : (getGitHeadContent(projDir, relFile) ?? '');
@@ -542,7 +550,7 @@ function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null,
 
     // Final transition: from the last backup to whatever is actually on disk right now.
     const current = readFileContentSafe(absPath);
-    if (current !== null && current !== list[list.length - 1].content) {
+    if (current !== null && !isBinaryContent(current) && current !== list[list.length - 1].content) {
       units.push({ file: relFile, absPath, before: list[list.length - 1].content, content: current, time: new Date() });
     } else if (list.length === 1) {
       const before = getGitHeadContent(projDir, relFile) ?? list[0].content;
@@ -557,7 +565,7 @@ function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null,
     if (versions.has(g.file)) continue;
     const absPath = path.join(projDir, g.file);
     const current = readFileContentSafe(absPath);
-    if (current === null) continue;
+    if (current === null || isBinaryContent(current)) continue;
     const before = getGitHeadContent(projDir, g.file) ?? '';
     const lastTimestamp = fallbackChanges
       .filter(c => (path.isAbsolute(c.file) ? path.relative(projDir, c.file) : c.file) === g.file)
@@ -573,7 +581,7 @@ function buildCommitUnits(sessionFilePaths: string[], claudeHome: string | null,
   for (const relFile of untrackedFiles) {
     const absPath = path.join(projDir, relFile);
     const current = readFileContentSafe(absPath);
-    if (current === null) continue;
+    if (current === null || isBinaryContent(current)) continue;
     let mtime: Date;
     try {
       mtime = fs.statSync(absPath).mtime;
@@ -920,6 +928,7 @@ function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], project
     const hash = Math.random().toString(16).substring(2, 9);
     const label = files.length === 1 ? files[0] : `${files.length} files`;
 
+    // Describe THIS bucket's own subdivision, not just "a change happened" - each bucket can be
     commits.push({
       hash,
       subject: `chore: update ${label}`,

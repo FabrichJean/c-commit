@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    # Build natively on macOS: pkg cross-compiling the macOS targets from a Linux runner has
+    # produced corrupted snapshots ("Cannot find module '/snapshot/dist/cli.cjs'") - building
+    # on macOS avoids that, and it's the only host that can codesign the macOS binaries.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +25,11 @@ jobs:
 
       - name: Compile cross-platform binaries
         run: npm run compile
+
+      - name: Ad-hoc codesign macOS binaries
+        run: |
+          codesign --force --sign - dist/bin/commit-planner-macos-arm64
+          codesign --force --sign - dist/bin/commit-planner-macos-x64
 
       - name: Publish release with binaries
         uses: softprops/action-gh-release@v2

@@ -101,6 +101,13 @@ else
 fi
 
 chmod +x "$INSTALL_DIR/$BIN_NAME"
+
+# macOS refuses to run an unsigned binary at all (killed with no explanation). Ad-hoc sign it
+# here regardless of where it came from - belt and suspenders alongside the CI-side signing.
+if [ "$OS" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$INSTALL_DIR/$BIN_NAME" 2>/dev/null || true
+fi
+
 echo "Installed '$BIN_NAME' -> $INSTALL_DIR/$BIN_NAME"
 
 case ":$PATH:" in

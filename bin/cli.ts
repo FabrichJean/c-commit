@@ -397,6 +397,73 @@ function getUntrackedFiles(projDir: string): string[] {
   }
 }
 
+// Build commit units directly from whatever is currently sitting in the working tree - modified,
+// staged, or untracked files per `git status` - with no Claude Code session involved at all.
+// Each unit diffs the file's current content against HEAD (or against '' for new/untracked
+// files), so this plugs into the same splitting/bucketing/apply pipeline as session-based units.
+function buildCommitUnitsFromGitDiff(projDir: string): CommitUnit[] {
+  let statusOutput: string;
+  try {
+    statusOutput = execFileSync('git', ['status', '--porcelain'], { cwd: projDir, stdio: 'pipe' }).toString();
+  } catch {
+    return [];
+  }
+
+  const units: CommitUnit[] = [];
+
+  for (const line of statusOutput.split('\n')) {
+    if (!line.trim()) continue;
+    const statusCode = line.slice(0, 2);
+    if (statusCode.includes('D')) continue; // deleted files have no content to commit here
+
+    let relFile = line.slice(3).trim();
+    if (relFile.includes(' -> ')) relFile = relFile.split(' -> ')[1]; // renames: use the new path
+    if (relFile.startsWith('"') && relFile.endsWith('"')) relFile = relFile.slice(1, -1);
+
+    const absPath = path.join(projDir, relFile);
+    const current = readFileContentSafe(absPath);
+    if (current === null) continue;
+
+    const isUntracked = statusCode.includes('?');
+    const before = isUntracked ? '' : (getGitHeadContent(projDir, relFile) ?? '');
+    if (before === current) continue;
+
+    let mtime: Date;
+    try {
+      mtime = fs.statSync(absPath).mtime;
+    } catch {
+      mtime = new Date();
+    }
+
+    units.push({ file: relFile, absPath, before, content: current, time: mtime });
+  }
+
+  units.sort((a, b) => a.time.getTime() - b.time.getTime());
+  return units;
+}
+
+// A short, token-frugal excerpt of what actually changed between two versions of a file - a
+// handful of +/- lines, so the AI (or a human reading the prompt) knows the real content of the
+// change, not just which file was touched.
+function summarizeDiffForPrompt(before: string, after: string, maxLines: number = 4): string {
+  if (before === after) return '';
+  const parts = diffLines(before, after);
+  const out: string[] = [];
+
+  for (const part of parts) {
+    if (out.length >= maxLines) break;
+    if (!part.added && !part.removed) continue;
+    const prefix = part.added ? '+' : '-';
+    for (const line of part.value.split('\n')) {
+      if (!line) continue;
+      if (out.length >= maxLines) break;
+      out.push(`${prefix} ${line.length > 100 ? line.slice(0, 100) + '…' : line}`);
+    }
+  }
+
+  return out.join('\n');
+}
+
 // Reconstruct the real, chronological sequence of file-content snapshots for a project using
 // Claude Code's own file-history backups (~/.claude/file-history/<sessionId>/<hash>@vN). This is
 // what lets a single file that was edited many times across a session become several real,
@@ -842,7 +909,7 @@ function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], project
     commits.push({
       hash,
       subject: `chore: update ${label}`,
-      body: `Reconstructed from ${bucket.length} real change(s) made by Claude Code to ${files.join(', ')} in ${projectName}.`,
+      body: `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}.`,
       timestamp,
       author: "Claude Code <claude@anthropic.com>"
     });
@@ -970,9 +1037,10 @@ async function runCommitPlanner() {
   const days = parseInt(rawDays) || 3;
 
   console.log();
-  const basisIndex = await selectOption('Base suggestions on real Claude Code modifications?', [
-    'A specific chat session',
-    'All sessions for this project (general)',
+  const basisIndex = await selectOption('How should commits be grounded?', [
+    'A specific Claude Code chat session',
+    'All Claude Code sessions for this project (general)',
+    'Current Git changes (diff) - no Claude Code session needed',
     'No - generate generic suggestions'
   ]);
   const basisChoice = String(basisIndex + 1);
@@ -980,9 +1048,12 @@ async function runCommitPlanner() {
   let changes: FileChange[] = [];
   let sessionFilePaths: string[] = [];
   let claudeHomeForUnits: string | null = null;
+  let gitDiffUnits: CommitUnit[] = [];
+  let attemptedRealBasis = false;
   let basisLabel = 'Generic (no session data)';
 
   if (basisChoice === '1' || basisChoice === '2') {
+    attemptedRealBasis = true;
     const sessions = findProjectSessions(projDir);
     claudeHomeForUnits = sessions.claudeHome;
     if (!sessions.claudeHome || !sessions.sessionDir || sessions.summaries.length === 0) {
@@ -1004,13 +1075,22 @@ async function runCommitPlanner() {
         ? `Session "${chosen.title || chosen.file}" - ${changes.length} file change(s)`
         : `Generic (no file changes recorded in session "${chosen.title || chosen.file}")`;
     }
+  } else if (basisChoice === '3') {
+    attemptedRealBasis = true;
   }
 
   // Get the repo into a real Git state now, before any Git-based scanning below (the untracked
-  // file catch-up in buildCommitUnits needs a real repository to query, or it silently finds
-  // nothing - see offerGitInitIfNeeded's comment).
-  if (sessionFilePaths.length > 0) {
+  // file catch-up in buildCommitUnits, and the Git-diff basis itself, both need a real
+  // repository to query, or they silently find nothing - see offerGitInitIfNeeded's comment).
+  if (attemptedRealBasis) {
     await offerGitInitIfNeeded(projDir, gitAuthor);
+  }
+
+  if (basisChoice === '3') {
+    gitDiffUnits = isGitRepo(projDir) ? buildCommitUnitsFromGitDiff(projDir) : [];
+    basisLabel = gitDiffUnits.length > 0
+      ? `Current Git changes - ${gitDiffUnits.length} file change(s)`
+      : 'Generic (no uncommitted Git changes found)';
   }
 
   // Reconstruct the real, chronological progression of every touched file (using Claude Code's own
@@ -1026,6 +1106,8 @@ async function runCommitPlanner() {
     const built = buildCommitUnits(sessionFilePaths, claudeHomeForUnits, projDir, changes);
     commitUnits = built.units;
     untrackedCount = built.untrackedCount;
+  } else if (gitDiffUnits.length > 0) {
+    commitUnits = gitDiffUnits;
   }
   if (commitUnits.length > 0 && commitUnits.length < count) {
     commitUnits = expandUnitsToCount(commitUnits, count);
@@ -1049,12 +1131,19 @@ async function runCommitPlanner() {
     ? unitBuckets.map((bucket, i) => {
         const files = Array.from(new Set(bucket.map(u => u.file)));
         const when = bucket[bucket.length - 1].time.toLocaleString();
-        return `Commit ${i + 1}: ${files.join(', ')} (${bucket.length} change(s), around ${when})`;
-      }).join('\n')
+        const header = `Commit ${i + 1}: ${files.join(', ')} (${bucket.length} change(s), around ${when})`;
+        // A short real diff excerpt per file (capped) so the AI knows what actually changed,
+        // not just which files were touched.
+        const excerpts = bucket.slice(0, 3)
+          .map(u => summarizeDiffForPrompt(u.before, u.content, 4))
+          .filter(Boolean)
+          .join('\n');
+        return excerpts ? `${header}\n${excerpts}` : header;
+      }).join('\n\n')
     : '';
 
-  const prompt = changes.length > 0 ? `
-        You are writing ${effectiveCount} git commit messages (subject + body only) describing real work Claude Code did on "${projName}" over ${days} days.
+  const prompt = commitUnits.length > 0 ? `
+        You are writing ${effectiveCount} git commit messages (subject + body only) describing real code changes in "${projName}" over ${days} days.
         The commits are already grouped and ordered for you from the real file-change history - keep this exact order and grouping, do not add, remove, merge, or reorder commits:
         ${changeSummaryLines}
 

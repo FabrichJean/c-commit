@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as os from 'os';
+import * as zlib from 'zlib';
 import { diffLines } from 'diff';
 
 // 24-bit true-color helper, for exact hex theme colors
@@ -1381,6 +1382,67 @@ async function runCommitPlanner() {
   }
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Streams the response body, rendering a live progress bar (or, on non-TTY output, periodic
+// percentage lines) so `cmt update` doesn't sit silently for the several seconds a ~15-20MB
+// compressed asset takes to fetch.
+async function downloadWithProgress(url: string, label: string): Promise<Buffer> {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+  const total = parseInt(res.headers.get('content-length') || '0', 10);
+  const isTTY = !!process.stdout.isTTY;
+  const barWidth = 28;
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let lastPercent = -1;
+
+  const reader = (res.body as any).getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    chunks.push(chunk);
+    received += chunk.length;
+
+    if (total > 0) {
+      const percent = Math.min(100, Math.round((received / total) * 100));
+      if (isTTY) {
+        const filled = Math.round((percent / 100) * barWidth);
+        const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
+        process.stdout.write(`\r${C.dim}${label} [${C.theme}${bar}${C.dim}] ${percent}% (${formatBytes(received)}/${formatBytes(total)})${C.reset}  `);
+      } else if (percent >= lastPercent + 10) {
+        lastPercent = percent;
+        console.log(`${C.dim}${label}: ${percent}% (${formatBytes(received)}/${formatBytes(total)})${C.reset}`);
+      }
+    } else if (isTTY) {
+      process.stdout.write(`\r${C.dim}${label}: ${formatBytes(received)}...${C.reset}  `);
+    }
+  }
+  if (isTTY) process.stdout.write('\n');
+  return Buffer.concat(chunks);
+}
+
+// Release assets are published compressed (.gz on macOS/Linux, .zip on Windows) - `tar` handles
+// both without adding a dependency and ships on every platform we target (including Windows 10
+// 1803+ / Windows 11, which bundle bsdtar as tar.exe).
+function extractSingleFileFromZip(zipBytes: Buffer, fileName: string): Buffer {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmt-update-'));
+  const zipPath = path.join(tmpDir, 'asset.zip');
+  try {
+    fs.writeFileSync(zipPath, zipBytes);
+    execFileSync('tar', ['-xf', zipPath, '-C', tmpDir], { stdio: 'pipe' });
+    return fs.readFileSync(path.join(tmpDir, fileName));
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 // Download the latest release for this platform and replace the currently running binary with
 // it. Only meaningful when running as the compiled `cmt` executable (pkg sets `process.pkg`) -
 // running this from source (tsx) would otherwise try to overwrite the system node/tsx binary.
@@ -1394,12 +1456,16 @@ async function runSelfUpdate(): Promise<void> {
   }
 
   let asset: string | null = null;
+  let compressedExt: '.gz' | '.zip' = '.gz';
   if (process.platform === 'darwin') {
     asset = process.arch === 'arm64' ? 'commit-planner-macos-arm64' : process.arch === 'x64' ? 'commit-planner-macos-x64' : null;
+    compressedExt = '.gz';
   } else if (process.platform === 'linux') {
     asset = process.arch === 'x64' ? 'commit-planner-linux-x64' : null;
+    compressedExt = '.gz';
   } else if (process.platform === 'win32') {
     asset = process.arch === 'x64' ? 'commit-planner-win-x64.exe' : null;
+    compressedExt = '.zip';
   }
 
   if (!asset) {
@@ -1407,7 +1473,7 @@ async function runSelfUpdate(): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`${C.dim}Checking the latest release of ${REPO_SLUG}...${C.reset}`);
+  console.log(`${C.dim}[1/4] Checking the latest release of ${REPO_SLUG}...${C.reset}`);
 
   let latestTag = '';
   try {
@@ -1420,22 +1486,33 @@ async function runSelfUpdate(): Promise<void> {
     // Non-fatal - we can still download the "latest" asset without knowing its tag name
   }
 
-  const downloadUrl = `https://github.com/${REPO_SLUG}/releases/latest/download/${asset}`;
-  console.log(`${C.dim}Downloading ${asset}${latestTag.length > 0 ? ` (${latestTag})` : ''}...${C.reset}`);
+  const compressedAsset = `${asset}${compressedExt}`;
+  const downloadUrl = `https://github.com/${REPO_SLUG}/releases/latest/download/${compressedAsset}`;
+  console.log(`${C.dim}[2/4] Downloading ${compressedAsset}${latestTag.length > 0 ? ` (${latestTag})` : ''}...${C.reset}`);
+
+  let compressedBytes: Buffer;
+  try {
+    compressedBytes = await downloadWithProgress(downloadUrl, 'Downloading');
+  } catch (err: any) {
+    console.log(`${C.red}Download failed: ${err.message}${C.reset}`);
+    process.exit(1);
+  }
+
+  console.log(`${C.dim}[3/4] Extracting...${C.reset}`);
 
   let bytes: Buffer;
   try {
-    const res = await fetch(downloadUrl);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    bytes = Buffer.from(await res.arrayBuffer());
+    bytes = compressedExt === '.gz' ? zlib.gunzipSync(compressedBytes) : extractSingleFileFromZip(compressedBytes, asset);
   } catch (err: any) {
-    console.log(`${C.red}Download failed: ${err.message}${C.reset}`);
+    console.log(`${C.red}Failed to extract the downloaded archive: ${err.message}${C.reset}`);
     process.exit(1);
   }
 
   const currentPath = process.execPath;
   const dir = path.dirname(currentPath);
   const tempPath = path.join(dir, `.${path.basename(currentPath)}.new`);
+
+  console.log(`${C.dim}[4/4] Installing...${C.reset}`);
 
   try {
     fs.writeFileSync(tempPath, bytes);
@@ -1474,7 +1551,7 @@ async function runSelfUpdate(): Promise<void> {
 
 // Main logic
 async function main() {
-  if (process.argv[2] === 'update') {
+  if (process.argv[2] === 'update' || process.argv[2] === '--update' || process.argv[2] === '-u' || process.argv[2] === 'upgrade' || process.argv[2] === '--upgrade') {
     await runSelfUpdate();
     process.exit(0);
   }

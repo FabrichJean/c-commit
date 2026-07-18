@@ -45,6 +45,26 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
+if [ -f "$INSTALL_DIR/$BIN_NAME" ]; then
+  echo "'$BIN_NAME' is already installed at $INSTALL_DIR/$BIN_NAME."
+  echo "Continuing will overwrite it with the latest version."
+  echo "To remove it instead, run:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | bash"
+  echo ""
+  REPLY=""
+  if { printf "Continue and reinstall/upgrade '%s'? [y/N] " "$BIN_NAME" > /dev/tty && read -r REPLY < /dev/tty; } 2>/dev/null; then
+    :
+  else
+    REPLY="y"
+    echo "(no interactive terminal detected - proceeding with upgrade)"
+  fi
+  case "$REPLY" in
+    [yY]*) ;;
+    *) echo "Aborted - existing installation left untouched."; exit 0 ;;
+  esac
+  echo ""
+fi
+
 if [ -n "$REPO_ROOT" ]; then
   BINARY_PATH="$REPO_ROOT/dist/bin/$ASSET"
 

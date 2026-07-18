@@ -11,6 +11,21 @@ $Asset = "commit-planner-win-x64.exe"
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
+$ExistingBinary = Join-Path $InstallDir $BinName
+if (Test-Path $ExistingBinary) {
+    Write-Host "'$BinName' is already installed at $ExistingBinary."
+    Write-Host "Continuing will overwrite it with the latest version."
+    Write-Host "To remove it instead, run:"
+    Write-Host "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex"
+    Write-Host ""
+    $Reply = Read-Host "Continue and reinstall/upgrade '$BinName'? [y/N]"
+    if ($Reply -notmatch '^[yY]') {
+        Write-Host "Aborted - existing installation left untouched."
+        exit 0
+    }
+    Write-Host ""
+}
+
 # Local clone (real script file with a sibling package.json) vs. piped via `irm | iex`
 # (no real file path) - decides whether to build locally or fetch a GitHub release.
 $RepoRoot = $null

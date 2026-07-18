@@ -1144,7 +1144,7 @@ async function runCommitPlanner() {
 
   const prompt = commitUnits.length > 0 ? `
         You are writing ${effectiveCount} git commit messages (subject + body only) describing real code changes in "${projName}" over ${days} days.
-        The commits are already grouped and ordered for you from the real file-change history - keep this exact order and grouping, do not add, remove, merge, or reorder commits:
+        The commits are already grouped and ordered for you from the real file-change history, including short diff excerpts for context - keep this exact order and grouping, do not add, remove, merge, or reorder commits:
         ${changeSummaryLines}
 
         Write a clear, specific subject and body for each commit reflecting what actually changed in that group.
@@ -1286,8 +1286,8 @@ async function runCommitPlanner() {
 
   let readyToApply = commitUnits.length > 0 && isGitRepo(projDir);
 
-  if (sessionFilePaths.length === 0) {
-    console.log(`${C.dim}(Apply unavailable: these are generic suggestions with no real file mapping. Pick a session-based basis to enable applying.)${C.reset}`);
+  if (!attemptedRealBasis) {
+    console.log(`${C.dim}(Apply unavailable: these are generic suggestions with no real file mapping. Pick a session or Git-diff basis to enable applying.)${C.reset}`);
   } else if (commitUnits.length === 0) {
     console.log(`${C.dim}(Apply unavailable: none of the recorded changes map to files inside this project folder.)${C.reset}`);
   } else if (!isGitRepo(projDir)) {
@@ -1318,6 +1318,52 @@ async function runCommitPlanner() {
   }
 }
 
+// Download the latest release for this platform and replace the currently running binary with
+// it. Only meaningful when running as the compiled `cmt` executable (pkg sets `process.pkg`) -
+// running this from source (tsx) would otherwise try to overwrite the system node/tsx binary.
+async function runSelfUpdate(): Promise<void> {
+  const REPO_SLUG = 'FabrichJean/ccommit';
+
+  if (!(process as any).pkg) {
+    console.log(`${C.yellow}'cmt update' only works in the compiled binary, not when running from source.${C.reset}`);
+    console.log(`${C.dim}From a clone, use 'git pull' instead.${C.reset}`);
+    process.exit(1);
+  }
+
+  let asset: string | null = null;
+  if (process.platform === 'darwin') {
+    asset = process.arch === 'arm64' ? 'commit-planner-macos-arm64' : process.arch === 'x64' ? 'commit-planner-macos-x64' : null;
+  } else if (process.platform === 'linux') {
+    asset = process.arch === 'x64' ? 'commit-planner-linux-x64' : null;
+  } else if (process.platform === 'win32') {
+    asset = process.arch === 'x64' ? 'commit-planner-win-x64.exe' : null;
+  }
+
+  if (!asset) {
+    console.log(`${C.red}Unsupported platform for self-update: ${process.platform}/${process.arch}${C.reset}`);
+    process.exit(1);
+  }
+
+  console.log(`${C.dim}Checking the latest release of ${REPO_SLUG}...${C.reset}`);
+
+  let latestTag = '';
+  try {
+    const res = await fetch(`https://api.github.com/repos/${REPO_SLUG}/releases/latest`);
+    if (res.ok) {
+      const data: any = await res.json();
+      latestTag = data.tag_name || '';
+    }
+  } catch {
+    // Non-fatal - we can still download the "latest" asset without knowing its tag name
+  }
+
+  const downloadUrl = `https://github.com/${REPO_SLUG}/releases/latest/download/${asset}`;
+  console.log(`${C.dim}Downloading ${asset}${latestTag.length > 0 ? ` (${latestTag})` : ''}...${C.reset}`);
+
+  let bytes: Buffer;
+  try {
+    const res = await fetch(downloadUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
 // Main logic
 async function main() {
   // Load environment variables from local .env if available

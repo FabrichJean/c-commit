@@ -33,6 +33,7 @@ export function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], 
     const timestamp = new Date(start + i * 24 * 60 * 60 * 1000).toISOString();
     const hash = Math.random().toString(16).substring(2, 9);
     const label = files.length === 1 ? files[0] : `${files.length} files`;
+    const allDeleted = bucket.every(u => u.content === null);
 
     // Describe THIS bucket's own subdivision, not just "a change happened" - each bucket can be
     // a different slice of the same file's diff (from expandUnitsToCount), so without this the
@@ -42,13 +43,14 @@ export function generateProceduralCommitsFromUnits(unitBuckets: CommitUnit[][], 
       .filter(Boolean)
       .join('\n');
 
+    const action = allDeleted ? 'Removed' : 'Reconstructed';
     const body = excerpt.length > 0
-      ? `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}:\n${excerpt}`
-      : `Reconstructed from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}.`;
+      ? `${action} from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}:\n${excerpt}`
+      : `${action} from ${bucket.length} real change(s) to ${files.join(', ')} in ${projectName}.`;
 
     commits.push({
       hash,
-      subject: `chore: update ${label}`,
+      subject: allDeleted ? `chore: remove ${label}` : `chore: update ${label}`,
       body,
       timestamp,
       author: "Claude Code <claude@anthropic.com>"

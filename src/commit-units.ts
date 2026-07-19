@@ -6,10 +6,10 @@ import { readFileContentSafe, isBinaryContent, getGitHeadContent, getUntrackedFi
 import { groupChangesByFile, type FileChange } from './claude-sessions';
 
 export interface CommitUnit {
-  file: string;     // path relative to the project dir
-  absPath: string;  // absolute path on disk
-  before: string;   // content right before this transition (for further line-level splitting)
-  content: string;  // real file content at this point in history
+  file: string;         // path relative to the project dir
+  absPath: string;      // absolute path on disk
+  before: string;       // content right before this transition (for further line-level splitting)
+  content: string | null; // real file content at this point in history, or null if this step deletes the file
   time: Date;
 }
 
@@ -33,13 +33,24 @@ export function buildCommitUnitsFromGitDiff(projDir: string): CommitUnit[] {
   for (const line of statusOutput.split('\n')) {
     if (!line.trim()) continue;
     const statusCode = line.slice(0, 2);
-    if (statusCode.includes('D')) continue; // deleted files have no content to commit here
 
     let relFile = line.slice(3).trim();
     if (relFile.includes(' -> ')) relFile = relFile.split(' -> ')[1]; // renames: use the new path
     if (relFile.startsWith('"') && relFile.endsWith('"')) relFile = relFile.slice(1, -1);
 
     const absPath = path.join(projDir, relFile);
+
+    if (statusCode.includes('D')) {
+      // A deletion has no on-disk content to diff against, but it's still a real change that
+      // needs to be committed (git rm, effectively) - dropping it here would leave the file
+      // deleted-but-uncommitted in the working tree after apply, with the rest of the plan
+      // committed around it.
+      const before = getGitHeadContent(projDir, relFile) ?? '';
+      if (before.length === 0) continue; // nothing meaningful to represent
+      units.push({ file: relFile, absPath, before, content: null, time: new Date() });
+      continue;
+    }
+
     const current = readFileContentSafe(absPath);
     if (current === null || isBinaryContent(current)) continue;
 
@@ -64,9 +75,10 @@ export function buildCommitUnitsFromGitDiff(projDir: string): CommitUnit[] {
 // A short, token-frugal excerpt of what actually changed between two versions of a file - a
 // handful of +/- lines, so the AI (or a human reading the prompt) knows the real content of the
 // change, not just which file was touched.
-export function summarizeDiffForPrompt(before: string, after: string, maxLines: number = 4): string {
-  if (before === after) return '';
-  const parts = diffLines(before, after);
+export function summarizeDiffForPrompt(before: string, after: string | null, maxLines: number = 4): string {
+  const afterText = after ?? '';
+  if (before === afterText) return '';
+  const parts = diffLines(before, afterText);
   const out: string[] = [];
 
   for (const part of parts) {
@@ -149,6 +161,10 @@ export function buildCommitUnits(sessionFilePaths: string[], claudeHome: string 
     const current = readFileContentSafe(absPath);
     if (current !== null && !isBinaryContent(current) && current !== list[list.length - 1].content) {
       units.push({ file: relFile, absPath, before: list[list.length - 1].content, content: current, time: new Date() });
+    } else if (current === null && list[list.length - 1].content.length > 0) {
+      // The file existed earlier in the session but has since been deleted from disk (e.g. via
+      // a Bash `rm`) - represent that as a real deletion instead of silently dropping it.
+      units.push({ file: relFile, absPath, before: list[list.length - 1].content, content: null, time: new Date() });
     } else if (list.length === 1) {
       const before = getGitHeadContent(projDir, relFile) ?? list[0].content;
       units.push({ file: relFile, absPath, before, content: list[0].content, time: list[0].time });
@@ -162,8 +178,11 @@ export function buildCommitUnits(sessionFilePaths: string[], claudeHome: string 
     if (versions.has(g.file)) continue;
     const absPath = path.join(projDir, g.file);
     const current = readFileContentSafe(absPath);
-    if (current === null || isBinaryContent(current)) continue;
+    if (current !== null && isBinaryContent(current)) continue;
     const before = getGitHeadContent(projDir, g.file) ?? '';
+    // The tool touched this file but it's gone from disk now - only worth a deletion unit if it
+    // actually existed in HEAD; otherwise there's nothing real to commit.
+    if (current === null && before.length === 0) continue;
     const lastTimestamp = fallbackChanges
       .filter(c => (path.isAbsolute(c.file) ? path.relative(projDir, c.file) : c.file) === g.file)
       .map(c => new Date(c.timestamp))
@@ -278,7 +297,9 @@ function splitContentIntoSteps(before: string, after: string, steps: number): st
 export function expandUnitsToCount(units: CommitUnit[], targetCount: number): CommitUnit[] {
   if (units.length === 0 || units.length >= targetCount) return units;
 
-  const capacities = units.map(u => u.before === u.content ? 0 : buildMicroSteps(u.before, u.content).filter(s => s.kind === 'change').length);
+  // Deletions are atomic - splitting one into "partially deleted" intermediate commits doesn't
+  // make sense, so they're never expanded (capacity 0).
+  const capacities = units.map(u => u.content === null || u.before === u.content ? 0 : buildMicroSteps(u.before, u.content).filter(s => s.kind === 'change').length);
   const totalCapacity = capacities.reduce((a, b) => a + b, 0);
   if (totalCapacity <= units.length) return units;
 
@@ -286,6 +307,10 @@ export function expandUnitsToCount(units: CommitUnit[], targetCount: number): Co
   const result: CommitUnit[] = [];
 
   units.forEach((u, idx) => {
+    if (u.content === null) {
+      result.push(u);
+      return;
+    }
     const cap = capacities[idx];
     if (cap <= 1) {
       result.push(u);
@@ -365,7 +390,12 @@ export function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], pr
       const files: string[] = [];
       try {
         for (const u of latestPerFile.values()) {
-          fs.writeFileSync(u.absPath, u.content, 'utf-8');
+          if (u.content === null) {
+            // A deletion step - remove the file so `git add` below stages its absence.
+            try { fs.unlinkSync(u.absPath); } catch {}
+          } else {
+            fs.writeFileSync(u.absPath, u.content, 'utf-8');
+          }
           files.push(path.relative(projDir, u.absPath));
         }
         execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });

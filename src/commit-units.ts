@@ -352,6 +352,13 @@ export function chunkUnitsIntoCommits(units: CommitUnit[], count: number): Commi
   return buckets;
 }
 
+// Whether `relFile` is still present in Git's index right now - regardless of whether it also
+// exists on disk. Used to detect deletions that have already been resolved by the time apply
+// runs (e.g. committed by another process in the same repo between plan generation and the
+// user confirming the apply prompt), so they can be skipped instead of failing `git add` with a
+// confusing "pathspec did not match any files".
+function isPathTracked(projDir: string, relFile: string): boolean {
+  try {
 // Parse a commit's stored timestamp into an ISO 8601 string Git will accept for
 // GIT_AUTHOR_DATE/GIT_COMMITTER_DATE, or null if it can't be parsed
 function toGitDate(timestamp: string | undefined): string | null {

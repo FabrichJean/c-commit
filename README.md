@@ -4,8 +4,6 @@ Un CLI interactif qui génère (et applique, si vous le souhaitez) des plannings
 
 ![Aperçu du CLI Claude Commit Planner](preview.png)
 
-Le projet contient aussi une application web compagnon indépendante (tableau de bord visuel), décrite en fin de document.
-
 ---
 
 ## Pour les utilisateurs

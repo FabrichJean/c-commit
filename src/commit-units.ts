@@ -416,8 +416,14 @@ export function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], pr
           } else {
             fs.writeFileSync(u.absPath, u.content, 'utf-8');
           }
-          files.push(path.relative(projDir, u.absPath));
+          files.push(relFile);
         }
+
+        if (files.length === 0) {
+          errors.push(`Commit #${i + 1}: all changes were already applied upstream, skipped.`);
+          continue;
+        }
+
         execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
 
         const gitDate = toGitDate(commits[i].timestamp);

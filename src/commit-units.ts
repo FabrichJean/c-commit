@@ -404,8 +404,14 @@ export function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], pr
       const files: string[] = [];
       try {
         for (const u of latestPerFile.values()) {
+          const relFile = path.relative(projDir, u.absPath);
           if (u.content === null) {
-            // A deletion step - remove the file so `git add` below stages its absence.
+            // A deletion step - remove the file so `git add` below stages its absence. But the
+            // Git state can shift between plan generation and this apply step (another process
+            // committing in the same repo, or the user doing so manually while the confirmation
+            // prompt was waiting) - if the path is no longer tracked at all, the deletion is
+            // already resolved and there's nothing left to stage for it.
+            if (!isPathTracked(projDir, relFile)) continue;
             try { fs.unlinkSync(u.absPath); } catch {}
           } else {
             fs.writeFileSync(u.absPath, u.content, 'utf-8');

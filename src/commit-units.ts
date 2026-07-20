@@ -359,6 +359,13 @@ export function chunkUnitsIntoCommits(units: CommitUnit[], count: number): Commi
 // confusing "pathspec did not match any files".
 function isPathTracked(projDir: string, relFile: string): boolean {
   try {
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', relFile], { cwd: projDir, stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Parse a commit's stored timestamp into an ISO 8601 string Git will accept for
 // GIT_AUTHOR_DATE/GIT_COMMITTER_DATE, or null if it can't be parsed
 function toGitDate(timestamp: string | undefined): string | null {

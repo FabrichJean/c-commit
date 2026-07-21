@@ -2,7 +2,7 @@
 # Installs the Claude Commit Planner binary as `cmt`.
 #
 # Run from a local clone (builds/uses dist/bin/*), or online without cloning:
-#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/install.sh | bash
 set -euo pipefail
 
 REPO="FabrichJean/c-commit"
@@ -32,12 +32,13 @@ case "$OS" in
     ;;
 esac
 
-# Local clone (has a real file path with a sibling package.json) vs. piped via curl
-# (no real file path) - decides whether to build locally or fetch a GitHub release.
+# Local clone (this script lives at <repo>/installers/install.sh, so the repo root is one
+# directory up) vs. piped via curl (no real file path) - decides whether to build locally or
+# fetch a GitHub release.
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 REPO_ROOT=""
 if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
-  CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
   if [ -f "$CANDIDATE_ROOT/package.json" ]; then
     REPO_ROOT="$CANDIDATE_ROOT"
   fi
@@ -49,7 +50,7 @@ if [ -f "$INSTALL_DIR/$BIN_NAME" ]; then
   echo "'$BIN_NAME' is already installed at $INSTALL_DIR/$BIN_NAME."
   echo "Continuing will overwrite it with the latest version."
   echo "To remove it instead, run:"
-  echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | bash"
+  echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/installers/uninstall.sh | bash"
   echo ""
   REPLY=""
   if { printf "Continue and reinstall/upgrade '%s'? [y/N] " "$BIN_NAME" > /dev/tty && read -r REPLY < /dev/tty; } 2>/dev/null; then

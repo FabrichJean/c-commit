@@ -1,7 +1,7 @@
 # Installs the Claude Commit Planner binary as `cmt`.
 #
 # Run from a local clone, or online without cloning:
-#   irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 # Piped execution (irm | iex) can inherit $ProgressPreference = 'SilentlyContinue', which hides
 # Invoke-WebRequest's built-in download progress bar - force it on so downloads aren't silent.
@@ -19,7 +19,7 @@ if (Test-Path $ExistingBinary) {
     Write-Host "'$BinName' is already installed at $ExistingBinary."
     Write-Host "Continuing will overwrite it with the latest version."
     Write-Host "To remove it instead, run:"
-    Write-Host "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex"
+    Write-Host "  irm https://raw.githubusercontent.com/$Repo/main/installers/uninstall.ps1 | iex"
     Write-Host ""
     $Reply = Read-Host "Continue and reinstall/upgrade '$BinName'? [y/N]"
     if ($Reply -notmatch '^[yY]') {
@@ -29,11 +29,12 @@ if (Test-Path $ExistingBinary) {
     Write-Host ""
 }
 
-# Local clone (real script file with a sibling package.json) vs. piped via `irm | iex`
-# (no real file path) - decides whether to build locally or fetch a GitHub release.
+# Local clone (this script lives at <repo>\installers\install.ps1, so the repo root is one
+# directory up) vs. piped via `irm | iex` (no real file path) - decides whether to build locally
+# or fetch a GitHub release.
 $RepoRoot = $null
 if ($PSCommandPath) {
-    $CandidateRoot = Split-Path -Parent $PSCommandPath
+    $CandidateRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
     if (Test-Path (Join-Path $CandidateRoot "package.json")) {
         $RepoRoot = $CandidateRoot
     }

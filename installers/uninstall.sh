@@ -2,7 +2,7 @@
 # Removes the `cmt` binary installed by install.sh.
 #
 # Run from a local clone, or online without cloning:
-#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/uninstall.sh | bash
 set -euo pipefail
 
 BIN_NAME="cmt"

@@ -4,11 +4,11 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "cli": "tsx bin/cli.ts",
+    "cli": "tsx src/main.ts",
     "build:cli": "node scripts/build-cli.mjs",
     "compile": "npm run build:cli && pkg dist/cli.cjs --targets node20-macos-arm64,node20-macos-x64,node20-linux-x64,node20-win-x64 --output dist/bin/commit-planner",
-    "install:cli": "./install.sh",
-    "uninstall:cli": "./uninstall.sh",
+    "install:cli": "./installers/install.sh",
+    "uninstall:cli": "./installers/uninstall.sh",
     "release": "node scripts/release.mjs",
     "lint": "tsc --noEmit"
   },

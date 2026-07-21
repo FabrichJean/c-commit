@@ -1,4 +1,4 @@
-// Bundles bin/cli.ts into dist/cli.cjs, embedding package.json's version as a compile-time
+// Bundles src/main.ts into dist/cli.cjs, embedding package.json's version as a compile-time
 // constant (__CMT_VERSION__) so the compiled `cmt` binary can report/compare its own version
 // (`cmt --version`, `cmt update`'s "already up to date" check) without needing package.json to
 // be present at runtime.
@@ -11,7 +11,7 @@ const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const pkg = JSON.parse(readFileSync(path.join(rootDir, 'package.json'), 'utf-8'));
 
 await build({
-  entryPoints: [path.join(rootDir, 'bin/cli.ts')],
+  entryPoints: [path.join(rootDir, 'src/main.ts')],
   bundle: true,
   platform: 'node',
   format: 'cjs',

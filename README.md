@@ -2,9 +2,9 @@
 
 Un CLI interactif qui génère (et applique, si vous le souhaitez) des plannings de commits Git réalistes — basés sur ce que Claude Code a **réellement** fait pendant vos sessions de chat, pas sur des suppositions.
 
-![Aperçu du CLI Claude Commit Planner](preview.png)
+![Aperçu du CLI Claude Commit Planner](docs/preview.png)
 
-Le projet contient aussi une application web compagnon indépendante (tableau de bord visuel), décrite en fin de document.
+(Une application web compagnon était prévue à l'origine ; elle n'est pas implémentée aujourd'hui — voir la note en fin de document.)
 
 ---
 
@@ -84,7 +84,7 @@ commit-planner-win-x64.exe
 
 Chacun embarque son propre runtime Node.js (~45-55 Mo non compressé) — aucune installation requise côté utilisateur final. `git` (et `claude`, si vous voulez l'IA locale) doivent toujours être présents sur la machine qui exécute le binaire.
 
-Les assets publiés sur les releases GitHub sont compressés (`.gz` pour macOS/Linux, `.zip` pour Windows) — environ **60-65% plus légers à télécharger** que les binaires bruts. `install.sh`/`install.ps1` les décompressent automatiquement avec des outils déjà présents sur chaque OS (`gzip`, `Expand-Archive`) — aucune dépendance supplémentaire à installer.
+Les assets publiés sur les releases GitHub sont compressés (`.gz` pour macOS/Linux, `.zip` pour Windows) — environ **60-65% plus légers à télécharger** que les binaires bruts. `installers/install.sh`/`installers/install.ps1` les décompressent automatiquement avec des outils déjà présents sur chaque OS (`gzip`, `Expand-Archive`) — aucune dépendance supplémentaire à installer.
 
 ### Installer la commande `cmt`
 
@@ -92,12 +92,12 @@ Les assets publiés sur les releases GitHub sont compressés (`.gz` pour macOS/L
 
 **macOS / Linux :**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/install.sh | bash
 ```
 
 **Windows (PowerShell) :**
 ```powershell
-irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/install.ps1 | iex
 ```
 
 Ceci télécharge directement le binaire adapté à votre OS/architecture depuis la [dernière release GitHub](https://github.com/FabrichJean/c-commit/releases/latest) — aucun clone, aucun Node.js requis.
@@ -107,8 +107,8 @@ Ceci télécharge directement le binaire adapté à votre OS/architecture depuis
 ```bash
 npm run install:cli
 # ou directement :
-./install.sh          # macOS / Linux
-.\install.ps1          # Windows (PowerShell)
+./installers/install.sh          # macOS / Linux
+.\installers\install.ps1          # Windows (PowerShell)
 ```
 
 Dans ce cas, le script compile le binaire localement (`npm run compile`) s'il n'existe pas encore dans `dist/bin/`.
@@ -139,30 +139,19 @@ Vérifie la dernière release GitHub par rapport à votre version actuelle (`cmt
 ```bash
 npm run uninstall:cli
 # ou en ligne, sans clone :
-curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/uninstall.sh | bash
 ```
 
 **Windows (PowerShell) :**
 ```powershell
-.\uninstall.ps1
+.\installers\uninstall.ps1
 # ou en ligne :
-irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/FabrichJean/c-commit/main/installers/uninstall.ps1 | iex
 ```
 
-### Application web compagnon (optionnelle, indépendante du CLI)
+### Application web compagnon
 
-Le dépôt contient aussi un petit tableau de bord web (React + Vite + Express), indépendant du CLI — il ne le lance plus automatiquement et n'en dépend pas.
-
-```bash
-npm run dev
-```
-
-Puis ouvrez [http://localhost:3000](http://localhost:3000). Pour une build de production :
-
-```bash
-npm run build
-npm run start
-```
+Une ancienne itération du projet prévoyait un tableau de bord web (React + Vite) en complément du CLI. Il n'est aujourd'hui pas implémenté — il n'en reste que des types partagés orphelins dans `src/types.ts` (aucun script `dev`/`build` correspondant dans `package.json`). À ignorer sauf si vous comptez reprendre cette partie.
 
 ---
 
@@ -171,40 +160,44 @@ npm run start
 ### Structure du projet
 
 ```
-bin/cli.ts        → le CLI (Claude Commit Planner), point d'entrée principal du projet
-bin/diff.d.ts      → déclaration de types locale pour le paquet `diff` (qui n'en fournit pas)
-bin/globals.d.ts    → déclaration de `__CMT_VERSION__` (injecté au build par scripts/build-cli.mjs)
-scripts/build-cli.mjs → bundle bin/cli.ts avec esbuild, en y injectant la version de package.json
-scripts/release.mjs   → bump package.json + commit + tag, en une seule action atomique (npm run release)
-install.sh          → installe le binaire compilé sous la commande `cmt` (macOS/Linux)
-install.ps1          → équivalent Windows (PowerShell)
-uninstall.sh         → retire `cmt` (macOS/Linux)
-uninstall.ps1        → équivalent Windows (PowerShell)
+src/main.ts              → point d'entrée du CLI : arguments (--version, update), chargement .env, boucle interactive
+src/planner.ts            → orchestration du planificateur interactif (runCommitPlanner)
+src/git.ts                → primitives Git/fichiers (auteur, dates, git init, fichiers non suivis...)
+src/claude-sessions.ts     → découverte et parsing des sessions Claude Code (~/.claude/projects)
+src/commit-units.ts        → reconstruction chronologique, découpage fin, application réelle des commits
+src/claude-cli.ts          → détection et appel en streaming du CLI Claude Code local
+src/procedural.ts          → générateur de commits hors-ligne (repli sans IA)
+src/self-update.ts         → `cmt update` (téléchargement avec progression, décompression, remplacement du binaire)
+src/version.ts             → résolution de la version (`__CMT_VERSION__` injecté au build, ou repli sur package.json en dev)
+src/ui/                   → couche terminal : couleurs (colors.ts), prompts/sélecteur à flèches (prompt.ts), bannière (banner.ts), curseur (terminal.ts)
+src/diff.d.ts              → déclaration de types locale pour le paquet `diff` (qui n'en fournit pas)
+src/globals.d.ts           → déclaration de `__CMT_VERSION__`
+src/types.ts               → types hérités de l'ancienne app web compagnon, non utilisés par le CLI
+scripts/build-cli.mjs    → bundle src/main.ts avec esbuild, en y injectant la version de package.json
+scripts/release.mjs      → bump package.json + commit + tag, en une seule action atomique (npm run release)
+installers/install.sh, install.ps1     → installent le binaire compilé sous la commande `cmt`
+installers/uninstall.sh, uninstall.ps1 → retirent `cmt`
+docs/preview.png         → capture d'écran utilisée dans ce README
 .github/workflows/release.yml → compile et publie les 4 binaires sur chaque tag `v*`
-server.ts          → serveur Express de l'application web compagnon
-src/               → application web compagnon (React + Vite)
 ```
 
-### Architecture du CLI (`bin/cli.ts`)
+### Architecture du CLI
 
-Grandes étapes du pipeline, dans l'ordre où elles apparaissent dans le fichier :
+Grandes étapes du pipeline, réparties sur plusieurs modules sous `src/` :
 
-1. **Détection des sessions Claude Code** — `locateClaudeCodeDir()`, `encodeProjectPath()` (reproduit l'encodage utilisé par Claude Code pour `~/.claude/projects/<encodé>`), `findProjectSessions()`, `summarizeSession()`.
-2. **Extraction des changements réels** — `extractFileChanges()` parcourt les blocs `tool_use` (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`) des transcripts `.jsonl`.
-3. **Reconstruction chronologique** — `buildCommitUnits()` lit les sauvegardes de versions de fichiers de Claude Code (`~/.claude/file-history/<session>/<hash>@vN`) pour retrouver l'état réel de chaque fichier à chaque étape. À défaut d'historique, diff contre `HEAD`.
-4. **Découpage fin** — `buildMicroSteps()` / `splitContentIntoSteps()` / `expandUnitsToCount()` : diff ligne-à-ligne (paquet `diff`) pour subdiviser une modification en plusieurs commits quand le nombre de "vraies" étapes est insuffisant par rapport au nombre demandé.
-5. **Génération des messages** — CLI Claude local en streaming (`runClaudeCliStreaming()`), puis API (Anthropic/Gemini), puis générateur procédural (`generateProceduralCommits*`), dans cet ordre de priorité.
-6. **Application réelle** — `applyCommitUnits()` écrit chaque état historique sur disque, commit, puis restaure garantit l'état réel du fichier (`try/finally`), même en cas d'erreur en cours de route.
+1. **Détection des sessions Claude Code** (`src/claude-sessions.ts`) — `locateClaudeCodeDir()`, `encodeProjectPath()` (reproduit l'encodage utilisé par Claude Code pour `~/.claude/projects/<encodé>`), `findProjectSessions()`, `summarizeSession()`, `extractFileChanges()` (parcourt les blocs `tool_use` — `Edit`, `MultiEdit`, `Write`, `NotebookEdit` — des transcripts `.jsonl`).
+2. **Reconstruction chronologique** (`src/commit-units.ts`) — `buildCommitUnits()` lit les sauvegardes de versions de fichiers de Claude Code (`~/.claude/file-history/<session>/<hash>@vN`) pour retrouver l'état réel de chaque fichier à chaque étape (à défaut d'historique, diff contre `HEAD`) ; `buildCommitUnitsFromGitDiff()` fait la même chose directement depuis `git status` quand aucune session n'est utilisée.
+3. **Découpage fin** (`src/commit-units.ts`) — diff ligne-à-ligne (paquet `diff`) via `expandUnitsToCount()` pour subdiviser une modification en plusieurs commits quand le nombre de "vraies" étapes est insuffisant par rapport au nombre demandé.
+4. **Génération des messages** — CLI Claude local en streaming (`src/claude-cli.ts`), puis API Anthropic/Gemini, puis générateur procédural (`src/procedural.ts`), dans cet ordre de priorité — orchestré depuis `src/planner.ts`.
+5. **Application réelle** (`src/commit-units.ts`) — `applyCommitUnits()` écrit chaque état historique sur disque, commit, puis restaure garantit l'état réel du fichier (`try/finally`), même en cas d'erreur en cours de route.
 
 ### Commandes utiles
 
 ```bash
 npm run cli        # lance le CLI en mode développement (via tsx, pas de build requis)
 npm run lint        # tsc --noEmit — à faire passer avant tout commit
-npm run build:cli    # bundle bin/cli.ts en un seul fichier CJS (dist/cli.cjs)
+npm run build:cli    # bundle src/main.ts en un seul fichier CJS (dist/cli.cjs)
 npm run compile      # build:cli + génère les 4 exécutables autonomes (voir plus haut)
-npm run dev          # lance le serveur de l'app web compagnon
-npm run build        # build de production de l'app web compagnon
 ```
 
 ### Publier une nouvelle release (binaires `cmt`)

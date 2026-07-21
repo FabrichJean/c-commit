@@ -353,10 +353,11 @@ export function chunkUnitsIntoCommits(units: CommitUnit[], count: number): Commi
 }
 
 // Whether `relFile` is still present in Git's index right now - regardless of whether it also
-// exists on disk. Used to detect deletions that have already been resolved by the time apply
-// runs (e.g. committed by another process in the same repo between plan generation and the
-// user confirming the apply prompt), so they can be skipped instead of failing `git add` with a
-// confusing "pathspec did not match any files".
+// exists on disk. Note this is true for an ordinary tracked file but false for a deletion that's
+// already been `git add`-ed (staged, not yet committed) - the index drops the entry the moment a
+// removal is staged, well before any commit captures it. Only use this to decide whether a fresh
+// `git add` is needed, never to decide whether a deletion still needs committing at all (use
+// getGitHeadContent for that - see applyCommitUnits).
 function isPathTracked(projDir: string, relFile: string): boolean {
   try {
     execFileSync('git', ['ls-files', '--error-unmatch', '--', relFile], { cwd: projDir, stdio: 'pipe' });
@@ -401,38 +402,51 @@ export function applyCommitUnits(commits: any[], unitBuckets: CommitUnit[][], pr
       const latestPerFile = new Map<string, CommitUnit>();
       for (const u of bucket) latestPerFile.set(u.absPath, u);
 
-      const files: string[] = [];
+      // Separate from filesToCommit because a deletion that's already staged (git add'd in an
+      // earlier, interrupted attempt) has nothing left to add - re-adding it fails with "pathspec
+      // did not match any files" even though it still genuinely needs to be committed.
+      const filesToStage: string[] = [];
+      const filesToCommit: string[] = [];
       try {
         for (const u of latestPerFile.values()) {
           const relFile = path.relative(projDir, u.absPath);
           if (u.content === null) {
-            // A deletion step - remove the file so `git add` below stages its absence. But the
             // Git state can shift between plan generation and this apply step (another process
             // committing in the same repo, or the user doing so manually while the confirmation
-            // prompt was waiting) - if the path is no longer tracked at all, the deletion is
-            // already resolved and there's nothing left to stage for it.
-            if (!isPathTracked(projDir, relFile)) continue;
-            try { fs.unlinkSync(u.absPath); } catch {}
+            // prompt was waiting). HEAD - not the index - is the source of truth for whether this
+            // deletion still needs a commit at all: the index entry disappears the moment the
+            // deletion is staged, well before it's actually committed.
+            if (getGitHeadContent(projDir, relFile) === null) continue; // already committed elsewhere
+            filesToCommit.push(relFile);
+            if (isPathTracked(projDir, relFile)) {
+              // Still has an index entry - not staged yet, so remove it from disk and stage it.
+              try { fs.unlinkSync(u.absPath); } catch {}
+              filesToStage.push(relFile);
+            }
+            // else: already staged (git add'd in an earlier attempt) - nothing to add, just commit it.
           } else {
             fs.writeFileSync(u.absPath, u.content, 'utf-8');
+            filesToStage.push(relFile);
+            filesToCommit.push(relFile);
           }
-          files.push(relFile);
         }
 
-        if (files.length === 0) {
+        if (filesToCommit.length === 0) {
           errors.push(`Commit #${i + 1}: all changes were already applied upstream, skipped.`);
           continue;
         }
 
-        execFileSync('git', ['add', '--', ...files], { cwd: projDir, stdio: 'pipe' });
+        if (filesToStage.length > 0) {
+          execFileSync('git', ['add', '--', ...filesToStage], { cwd: projDir, stdio: 'pipe' });
+        }
 
         const gitDate = toGitDate(commits[i].timestamp);
         const commitEnv = gitDate ? { ...process.env, GIT_AUTHOR_DATE: gitDate, GIT_COMMITTER_DATE: gitDate } : process.env;
-        execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...files], { cwd: projDir, stdio: 'pipe', env: commitEnv });
+        execFileSync('git', ['commit', '-m', commits[i].subject || 'Update', '-m', commits[i].body || '', '--author', commits[i].author, '--', ...filesToCommit], { cwd: projDir, stdio: 'pipe', env: commitEnv });
         applied++;
       } catch (err: any) {
         const message = (err.stderr?.toString() || err.message || '').split('\n')[0];
-        errors.push(`Commit #${i + 1} (${files.join(', ')}): ${message}`);
+        errors.push(`Commit #${i + 1} (${filesToCommit.join(', ')}): ${message}`);
       }
     }
   } finally {
